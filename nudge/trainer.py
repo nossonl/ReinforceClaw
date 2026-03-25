@@ -109,13 +109,13 @@ def _tokenize(tokenizer, item):
     }
 
 
-def _make_loss_fn(tokenized, ref_logprobs, cfg, ema_mean):
+def _make_loss_fn(model, tokenized, ref_logprobs, cfg, ema_mean):
     # loss function — idx picks which sample from the batch
     tc_lo, tc_hi = cfg["token_clip"]
     tj_lo, tj_hi = cfg["traj_clip"]
     kl_c, pw = cfg["kl_coeff"], cfg["pos_weight"]
 
-    def loss_fn(model, idx: int):
+    def loss_fn(idx: int):
         t = tokenized[idx]
         ids, start, rating = t["input_ids"], t["response_start"], t["rating"]
         ref = ref_logprobs[idx]
@@ -192,7 +192,7 @@ def train(config, conn):
     opt = optim.Adam(learning_rate=cfg["lr"])
 
     ema_mean, ema_count = db.get_ema(conn)
-    loss_fn = _make_loss_fn(tokenized, ref_lps, cfg, ema_mean)
+    loss_fn = _make_loss_fn(policy, tokenized, ref_lps, cfg, ema_mean)
 
     # nn.value_and_grad captures the model — DON'T pass it again when calling
     vg = nn.value_and_grad(policy, loss_fn)
