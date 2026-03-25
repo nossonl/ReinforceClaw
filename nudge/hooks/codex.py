@@ -85,7 +85,7 @@ def handle_stop():
         return
 
     conn = db.connect()
-    fid = db.add_feedback(conn, config["model"], "(codex)", last_msg, 0, source="hook")
+    fid = db.add_feedback(conn, config["model"], "(codex)", last_msg, 0, source="codex")
     conn.close()
 
     # NOT daemon — thread must stay alive for tkinter mainloop

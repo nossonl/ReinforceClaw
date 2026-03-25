@@ -69,7 +69,7 @@ def handle_stop():
             break
 
     conn = db.connect()
-    current_id = db.add_feedback(conn, config["model"], prompt, last_msg, 0, source="hook")
+    current_id = db.add_feedback(conn, config["model"], prompt, last_msg, 0, source="claude_code")
 
     if config.get("panel_enabled", True):
         from nudge.feedback import collect_rating
@@ -121,13 +121,13 @@ def handle_prompt():
             print(json.dumps({"result": "block", "reason": "Handled by nudge: not initialized"}))
             return
         rating = 1 if cmd == "good" else -1
-        pending = db.latest_pending(conn, source="hook")
+        pending = db.latest_pending(conn, source="claude_code")
         if pending:
             db.update_feedback_rating(conn, pending["id"], rating)
         else:
             # try to get last message from hook data
             last_msg = data.get("last_assistant_message", "(from chat)")
-            db.add_feedback(conn, config.get("model", ""), "(from chat)", last_msg, rating, source="hook")
+            db.add_feedback(conn, config.get("model", ""), "(from chat)", last_msg, rating, source="claude_code")
         label = "\033[32mgood\033[0m" if rating == 1 else "\033[31mbad\033[0m"
         sys.stderr.write(f"Rated: {label}\n")
         if _trainable_untrained(conn) >= config.get("batch_min", 16):
