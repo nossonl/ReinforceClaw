@@ -36,16 +36,21 @@ DEFAULTS = {
 
 MODELS = {
     "Qwen": [
-        "Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B",
-        "Qwen/Qwen3-8B", "Qwen/Qwen3-14B", "Qwen/Qwen3-32B",
-        "Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B",
+        # 3.5 (newest)
         "Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-27B", "Qwen/Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-122B-A10B", "Qwen/Qwen3.5-397B-A17B",
+        # 3
+        "Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B",
+        "Qwen/Qwen3-8B", "Qwen/Qwen3-14B", "Qwen/Qwen3-32B",
+        "Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B",
+        # 2.5
         "Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen2.5-14B-Instruct",
         "Qwen/Qwen2.5-32B-Instruct", "Qwen/Qwen2.5-72B-Instruct",
+        # coder + reasoning
+        "Qwen/Qwen3-Coder-30B-A3B-Instruct",
         "Qwen/Qwen2.5-Coder-7B-Instruct", "Qwen/Qwen2.5-Coder-32B-Instruct",
-        "Qwen/Qwen3-Coder-30B-A3B-Instruct", "Qwen/QwQ-32B",
+        "Qwen/QwQ-32B",
     ],
     "Meta": [
         "meta-llama/Llama-3.2-1B-Instruct", "meta-llama/Llama-3.2-3B-Instruct",
@@ -178,8 +183,8 @@ def reset_state():
 
 def cmd_init(_args):
     console.print(LOGO)
-    console.print(Panel("Personal RL for your AI — rate responses, train a local LoRA.",
-                        title="Welcome to Nudge", border_style="cyan"))
+    console.print(Panel("Hands-off reinforcement learning. Rate responses, your model learns the rest.",
+                        title="Welcome to Nudge", border_style="green"))
 
     # agents
     agents = []
@@ -207,8 +212,7 @@ def cmd_init(_args):
     else:
         model_name = Prompt.ask("HuggingFace model ID")
 
-    if any(kw in model_name.lower() for kw in ["moe", "mixture"]):
-        console.print("\n[yellow]MoE detected. Works but uses more memory (LoRA on all experts).[/yellow]")
+    # MoE models work fine, no warning needed — user picked what they want
 
     # preset
     console.print("\n[bold]Training preset:[/bold]")
@@ -235,11 +239,12 @@ def cmd_init(_args):
 
     console.print("\n")
     console.print(Panel(
-        "[bold]Rate BOTH good AND bad responses.[/bold]\n\n"
-        "If you only rate bad, your model learns what to avoid but not what to do.\n"
-        "Both signals are essential.\n\n"
+        "[bold red]Rate BOTH good AND bad responses.[/bold red]\n\n"
+        "If you only rate bad, your model will get WORSE — it learns what to avoid\n"
+        "but has no idea what you actually want. It needs both signals to improve.\n"
+        "Bad only = broken model. Good only = weak model. Both = the goal.\n\n"
         "[dim]Your adapter only works on this exact model. Switching models = fresh start.[/dim]",
-        title="Important", border_style="yellow"))
+        title="Important", border_style="red"))
     console.print(Panel(
         f"Model: [bold]{model_name}[/bold] | Preset: [bold]{preset_name}[/bold] | Server: [bold]{server}[/bold]\n"
         f"Config: [dim]{CONFIG_PATH}[/dim]\n\n"

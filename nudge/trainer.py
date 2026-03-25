@@ -147,8 +147,7 @@ def train(config, conn):
     """One training round. Returns metrics or None if not enough data."""
     _ensure_mlx()
     batch_min = config.get("batch_min", 16)
-    untrained = db.get_untrained(conn)
-    if len(untrained) < batch_min:
+    if db.count_trainable_untrained(conn) < batch_min:
         return None
 
     model_name = config["model"]
@@ -200,14 +199,12 @@ def train(config, conn):
 
         acc_grads = mx.tree_map(lambda g: g / cfg["grad_accum"], acc_grads)
 
-        # gradient clipping
+        # gradient clipping — no cpu-gpu sync, just multiply (1.0 when under limit)
         flat = [g for _, g in nn.utils.tree_flatten(acc_grads)]
         if flat:
             norm = mx.sqrt(sum(mx.sum(g * g) for g in flat))
             scale = mx.minimum(mx.array(cfg["grad_clip"]) / (norm + 1e-6), mx.array(1.0))
-            mx.eval(scale)
-            if scale.item() < 1.0:
-                acc_grads = mx.tree_map(lambda g: g * scale, acc_grads)
+            acc_grads = mx.tree_map(lambda g: g * scale, acc_grads)
 
         opt.update(policy, acc_grads)
         mx.eval(policy.parameters())

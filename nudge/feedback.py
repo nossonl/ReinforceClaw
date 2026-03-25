@@ -5,7 +5,6 @@
 
 import os
 import sys
-import select
 from typing import Optional
 
 _KEYS = {"1": 1, "2": -1, "3": None}  # good, bad, skip

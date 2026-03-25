@@ -4,8 +4,8 @@
 # click a filled one again → goes back to empty (undo). circles never disappear.
 
 import json
+import subprocess
 import sys
-import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -29,28 +29,27 @@ def _show_buttons(feedback_id, config):
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"80x32+{sw // 2 - 40}+{sh - 70}")
 
-    selected = [None]  # None = nothing picked yet
-    colors = {1: "#22c55e", -1: "#ef4444"}  # green for good, red for bad
+    selected = [None]
+    colors = {1: "#22c55e", -1: "#ef4444"}
 
     def _click(canvas, oval, other_canvas, other_oval, rating):
         if selected[0] == rating:
-            # already filled — undo it, go back to empty
             canvas.itemconfig(oval, fill="")
             conn = db.connect()
             db.update_feedback_rating(conn, feedback_id, 0)
             conn.close()
             selected[0] = None
             return
-
-        # fill this one, unfill the other
         canvas.itemconfig(oval, fill=colors[rating])
         other_canvas.itemconfig(other_oval, fill="")
-
         conn = db.connect()
         db.update_feedback_rating(conn, feedback_id, rating)
         if db.count_trainable_untrained(conn) >= config.get("batch_min", 16):
-            from nudge.hooks.claude_code import _queue_training
-            _queue_training(config)
+            subprocess.Popen(
+                [sys.executable, "-m", "nudge.cli", "train"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
         conn.close()
         selected[0] = rating
 
@@ -58,7 +57,6 @@ def _show_buttons(feedback_id, config):
     frame = tk.Frame(root, bg=bg)
     frame.pack(expand=True)
 
-    # left circle = good, right circle = bad
     c1 = tk.Canvas(frame, width=24, height=24, bg=bg, highlightthickness=0, cursor="hand2")
     o1 = c1.create_oval(2, 2, 22, 22, fill="", outline="black", width=2)
     c1.pack(side="left", padx=4)
@@ -90,10 +88,12 @@ def handle_stop():
     fid = db.add_feedback(conn, config["model"], "(codex)", last_msg, 0, source="hook")
     conn.close()
 
-    t = threading.Thread(target=_show_buttons, args=(fid, config), daemon=True)
+    # NOT daemon — thread must stay alive for tkinter mainloop
+    t = threading.Thread(target=_show_buttons, args=(fid, config))
     t.start()
 
 
 if __name__ == "__main__":
+    import threading
     if len(sys.argv) > 1 and sys.argv[1] == "stop":
         handle_stop()
