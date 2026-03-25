@@ -30,7 +30,7 @@ def _adapter_dir():
 
 
 def _apply_lora(model, rank=16):
-    """Walk the full model tree — including lists of layers — and swap Linear → LoRA."""
+    # swap all Linear layers to LoRA, including inside lists
     # bug fix: vanilla recursion skipped list children (e.g. model.layers),
     # meaning LoRA was applied to almost nothing. now we handle lists too.
     def _replace(module):
@@ -99,7 +99,7 @@ def _tokenize(tokenizer, item):
 
 
 def _make_loss_fn(tokenized, ref_logprobs, cfg, ema_mean):
-    """Closed-over loss. One sample at a time (idx selects which)."""
+    # loss function — idx picks which sample from the batch
     tc_lo, tc_hi = cfg["token_clip"]
     tj_lo, tj_hi = cfg["traj_clip"]
     kl_c, pw = cfg["kl_coeff"], cfg["pos_weight"]
@@ -144,7 +144,7 @@ def _make_loss_fn(tokenized, ref_logprobs, cfg, ema_mean):
 
 
 def train(config, conn):
-    """One training round. Returns metrics or None if not enough data."""
+    # one round of training
     _ensure_mlx()
     batch_min = config.get("batch_min", 16)
     if db.count_trainable_untrained(conn) < batch_min:
@@ -272,7 +272,7 @@ def _convert_to_gguf(adapter_dir):
 
 
 def hot_swap(server_type, adapter_path, model_name):
-    """Push new adapter into running server. Handles conversion automatically."""
+    # push adapter to whatever server is running
     import requests
     adapter_dir = str(Path(adapter_path).parent)
 

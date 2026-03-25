@@ -159,6 +159,13 @@ def update_ema(conn, mean, n):
 
 # -- adapter ops --
 
+def list_adapters(conn):
+    rows = conn.execute(
+        "SELECT version, status, created_at FROM adapters ORDER BY version DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def add_adapter(conn, version, path, parent=None, metrics=None):
     conn.execute(
         "INSERT INTO adapters (version, path, parent_version, metrics) VALUES (?,?,?,?)",
@@ -172,6 +179,14 @@ def latest_adapter(conn):
         "SELECT * FROM adapters WHERE status='active' ORDER BY version DESC LIMIT 1"
     ).fetchone()
     return dict(r) if r else None
+
+
+def rollback_to(conn, version):
+    # go back to this version, mark everything newer as rolled back
+    conn.execute("UPDATE adapters SET status='rolled_back' WHERE version > ?", (version,))
+    conn.execute("UPDATE adapters SET status='active' WHERE version = ?", (version,))
+    conn.commit()
+    return latest_adapter(conn)
 
 
 def rollback(conn):

@@ -25,8 +25,11 @@ def _cfg():
 
 
 def _maybe_train(conn):
-    """kick off training in background if we have enough ratings"""
-    if db.count_trainable_untrained(conn) >= _cfg().get("batch_min", 16):
+    """only auto-train if schedule is auto — otherwise launchd/systemd handles it"""
+    cfg = _cfg()
+    if cfg.get("train_schedule", "03:00") != "auto":
+        return
+    if db.count_trainable_untrained(conn) >= cfg.get("batch_min", 16):
         subprocess.Popen(
             [sys.executable, "-m", "nudge.cli", "train"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

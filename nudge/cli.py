@@ -136,9 +136,16 @@ def cmd_init(_args):
     console.print("\n[bold]Training preset:[/bold]")
     for i, (name, info) in enumerate(PRESETS.items(), 1):
         console.print(f"  [green]{i}[/green]. [bold]{name}[/bold] — {info['desc']}")
-    pc = _clamp(IntPrompt.ask("Preset", default=2), 1, 3)
-    preset_name = list(PRESETS.keys())[pc - 1]
-    preset = PRESETS[preset_name]
+    console.print(f"  [green]4[/green]. [bold]custom[/bold] — set your own learning rate and steps")
+    pc = _clamp(IntPrompt.ask("Preset", default=2), 1, 4)
+    if pc <= 3:
+        preset_name = list(PRESETS.keys())[pc - 1]
+        preset = PRESETS[preset_name]
+    else:
+        preset_name = "custom"
+        lr = float(Prompt.ask("Learning rate", default="4e-6"))
+        steps = IntPrompt.ask("Steps per round", default=8)
+        preset = {"lr": lr, "traj_clip": [0.992, 1.002], "steps": steps}
 
     # server
     servers = ["Ollama", "LM Studio", "vLLM", "Other"]
@@ -176,8 +183,8 @@ def cmd_init(_args):
         f"Config: [dim]{CONFIG_PATH}[/dim]\n\n"
         f"1. Use your AI agent normally\n"
         f"2. Rate responses (panel or /rl good / /rl bad)\n"
-        f"3. After {cfg['batch_min']} ratings, training starts automatically\n"
-        f"4. [bold]nudge status[/bold] to check progress",
+        f"3. Training runs daily at {cfg.get('train_schedule', '03:00')} (or [bold]nudge train[/bold] anytime)\n"
+        f"4. [bold]nudge status[/bold] to check progress | [bold]nudge history[/bold] to fix ratings",
         title="Setup complete", border_style="green"))
 
 
@@ -265,7 +272,7 @@ def _install_openclaw_plugin():
 # -- rating commands --
 
 def cmd_rate(_args, rating=None):
-    """Rate last response. Used by both cmd_good and cmd_bad."""
+    # rate the last response
     cfg = _load_model_cfg()
     if not cfg:
         return
@@ -299,6 +306,19 @@ def cmd_train(_args):
     if not cfg:
         return
     conn = db.connect()
+    n = _trainable_untrained(conn)
+    batch_min = cfg.get("batch_min", 16)
+    if n < batch_min:
+        console.print(f"[yellow]Only {n} rated responses. Need at least {batch_min}.[/yellow]")
+        conn.close()
+        return
+    if n < batch_min * 2:
+        if not Confirm.ask(f"[yellow]{n} ratings — might be weak with so few. Train anyway?[/yellow]"):
+            conn.close()
+            return
+    elif not Confirm.ask(f"{n} ratings ready. Train now?"):
+        conn.close()
+        return
     console.print("[bold]Training...[/bold]")
     metrics = trainer.train(cfg, conn)
     if metrics:
@@ -309,8 +329,7 @@ def cmd_train(_args):
             console.print("[green]Adapter loaded.[/green]" if ok
                           else "[yellow]Hot-swap failed. Restart server manually.[/yellow]")
     else:
-        console.print(f"[yellow]Not enough data. {_trainable_untrained(conn)} trainable untrained, "
-                       f"need {cfg.get('batch_min', 16)}.[/yellow]")
+        console.print("[yellow]Training failed.[/yellow]")
     conn.close()
 
 
@@ -339,12 +358,24 @@ def cmd_status(_args):
 def cmd_rollback(_args):
     cfg = load_config()
     conn = db.connect()
-    prev = db.rollback(conn)
+    adapters = db.list_adapters(conn)
+    if not adapters:
+        console.print("[yellow]No adapters to roll back to.[/yellow]")
+        conn.close()
+        return
+    t = Table(title="Adapters", border_style="green")
+    t.add_column("#", style="dim")
+    t.add_column("Status")
+    t.add_column("Created")
+    for a in adapters:
+        status = "[green]active[/green]" if a["status"] == "active" else "[dim]rolled back[/dim]"
+        t.add_row(f"v{a['version']}", status, a["created_at"])
+    console.print(t)
+    pick = IntPrompt.ask("Roll back to version", default=adapters[0]["version"])
+    prev = db.rollback_to(conn, pick)
     if prev:
-        console.print(f"[green]Rolled back to v{prev['version']}[/green]")
+        console.print(f"[green]Now on v{prev['version']}[/green]")
         trainer.hot_swap(cfg.get("server", "ollama"), prev["path"], cfg.get("model", ""))
-    else:
-        console.print("[yellow]No previous adapter.[/yellow]")
     conn.close()
 
 
@@ -363,6 +394,9 @@ def cmd_off(_a):
 
 
 def _maybe_train(cfg, conn):
+    # only auto-train if schedule is "auto" — otherwise the scheduler handles it
+    if cfg.get("train_schedule", "03:00") != "auto":
+        return
     if _trainable_untrained(conn) >= cfg.get("batch_min", 16):
         console.print("[dim]Batch ready, training...[/dim]")
         metrics = trainer.train(cfg, conn)
@@ -372,7 +406,7 @@ def _maybe_train(cfg, conn):
 
 
 def cmd_history(_args):
-    """Show recent ratings. Type a number to flip its rating."""
+    """Show recent ratings. Use 'nudge rate <id> good/bad' to change one."""
     conn = db.connect()
     rows = db.recent(conn)
     if not rows:
@@ -411,10 +445,14 @@ def cmd_schedule(_args):
     from nudge import scheduler
     cfg = load_config()
     if hasattr(_args, 'time') and _args.time:
-        cfg["train_schedule"] = _args.time
+        val = _args.time
+        if val not in ("auto", "manual") and ":" not in val:
+            console.print("[red]Use HH:MM format, 'auto', or 'manual'[/red]")
+            return
+        cfg["train_schedule"] = val
         save_config(cfg)
-        scheduler.install(_args.time)
-        console.print(f"[green]Schedule set: {_args.time}[/green]")
+        scheduler.install(val)
+        console.print(f"[green]Schedule set: {val}[/green]")
     else:
         console.print(f"Current: {cfg.get('train_schedule', '03:00')}")
         console.print("[dim]nudge schedule 03:00 / auto / manual[/dim]")
