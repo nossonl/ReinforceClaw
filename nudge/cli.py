@@ -49,14 +49,15 @@ MODELS = {
 }
 
 LOGO = r"""
-[bold cyan]
+[bold green]
     _   __          __
    / | / /__  ____/ /___ ____
   /  |/ / / / / __  / __ `/ _ \
  / /|  / /_/ / /_/ / /_/ /  __/
 /_/ |_/\__,_/\__,_/\__, /\___/
                   /____/
-[/bold cyan]"""
+[/bold green]
+[dim]# ai designed this lol[/dim]"""
 
 
 def load_config():
@@ -191,8 +192,8 @@ def _install_hooks(cfg):
         _install_claude_code_hooks(hook_dir)
     if "codex" in cfg.get("agents", []):
         _install_codex_hooks(hook_dir)
-    # openclaw: uses its own plugin system, installed via `openclaw plugins install`
-    # discord/telegram/whatsapp: separate bot processes, not hooks
+    if "openclaw" in cfg.get("agents", []):
+        _install_openclaw_plugin()
 
 
 def _install_claude_code_hooks(hook_dir):
@@ -239,6 +240,29 @@ def _install_codex_hooks(hook_dir):
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     hooks_path.write_text(json.dumps(hooks_cfg, indent=2) + "\n")
     console.print(f"[green]Codex hooks installed:[/green] {hooks_path}")
+
+
+def _install_openclaw_plugin():
+    """Auto-install the nudge plugin into openclaw. Detects platforms automatically."""
+    plugin_dir = Path(__file__).parent.parent / "openclaw-plugin"
+    if not plugin_dir.exists():
+        console.print("[yellow]openclaw-plugin/ not found. Skipping.[/yellow]")
+        return
+    # try to install — if openclaw isn't installed it'll just fail quietly
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["openclaw", "plugins", "install", str(plugin_dir)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            console.print("[green]OpenClaw plugin installed — all platforms connected[/green]")
+        else:
+            console.print(f"[yellow]OpenClaw plugin install failed: {result.stderr.strip()}[/yellow]")
+    except FileNotFoundError:
+        console.print("[yellow]openclaw not found. Install it first, then run nudge init again.[/yellow]")
+    except subprocess.TimeoutExpired:
+        console.print("[yellow]OpenClaw plugin install timed out.[/yellow]")
 
 
 # -- rating commands --
