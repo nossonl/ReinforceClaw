@@ -277,7 +277,7 @@ def cmd_rate(_args, rating=None):
     if not cfg:
         return
     conn = db.connect()
-    pending = db.latest_pending(conn, source="cli")
+    pending = db.latest_pending(conn)  # find any unrated response, regardless of source
     if pending:
         db.update_feedback_rating(conn, pending["id"], rating)
     else:

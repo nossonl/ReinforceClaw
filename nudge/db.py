@@ -167,6 +167,8 @@ def list_adapters(conn):
 
 
 def add_adapter(conn, version, path, parent=None, metrics=None):
+    # deactivate all previous adapters — only one active at a time
+    conn.execute("UPDATE adapters SET status='inactive' WHERE status='active'")
     conn.execute(
         "INSERT INTO adapters (version, path, parent_version, metrics) VALUES (?,?,?,?)",
         (version, path, parent, json.dumps(metrics) if metrics else None),
