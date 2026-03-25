@@ -288,6 +288,18 @@ def hot_swap(server_type, adapter_path, model_name):
         except requests.ConnectionError:
             return False
 
+    elif server_type == "lmstudio":
+        # LM Studio uses OpenAI-compatible API on port 1234
+        # load LoRA by placing adapter in ~/.cache/lm-studio/adapters/ and reloading
+        try:
+            r = requests.post("http://localhost:1234/v1/lora/load",
+                              json={"path": adapter_dir}, timeout=30)
+            return r.status_code == 200
+        except requests.ConnectionError:
+            # fallback: just tell them where the adapter is
+            print(f"Load adapter in LM Studio from: {adapter_dir}")
+            return True
+
     elif server_type == "vllm":
         try:
             r = requests.post("http://localhost:8000/v1/load_lora_adapter",

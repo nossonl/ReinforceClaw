@@ -115,7 +115,7 @@ def cmd_init(_args):
     console.print("\n[bold]Pick your local model:[/bold]")
     companies = list(MODELS.keys()) + ["Other (HuggingFace ID)"]
     for i, c in enumerate(companies, 1):
-        console.print(f"  [cyan]{i}[/cyan]. {c}")
+        console.print(f"  [green]{i}[/green]. {c}")
 
     choice = _clamp(IntPrompt.ask("Company", default=1), 1, len(companies))
     if choice <= len(MODELS):
@@ -123,7 +123,7 @@ def cmd_init(_args):
         models = MODELS[company]
         console.print(f"\n[bold]{company} models:[/bold]")
         for i, m in enumerate(models, 1):
-            console.print(f"  [cyan]{i}[/cyan]. {m}")
+            console.print(f"  [green]{i}[/green]. {m}")
         mc = _clamp(IntPrompt.ask("Model", default=1), 1, len(models))
         model_name = models[mc - 1]
     else:
@@ -134,17 +134,18 @@ def cmd_init(_args):
     # preset
     console.print("\n[bold]Training preset:[/bold]")
     for i, (name, info) in enumerate(PRESETS.items(), 1):
-        console.print(f"  [cyan]{i}[/cyan]. [bold]{name}[/bold] — {info['desc']}")
+        console.print(f"  [green]{i}[/green]. [bold]{name}[/bold] — {info['desc']}")
     pc = _clamp(IntPrompt.ask("Preset", default=2), 1, 3)
     preset_name = list(PRESETS.keys())[pc - 1]
     preset = PRESETS[preset_name]
 
     # server
+    servers = ["Ollama", "LM Studio", "vLLM", "Other"]
     console.print("\n[bold]Inference server:[/bold]")
-    for i, s in enumerate(["Ollama", "vLLM", "Other"], 1):
-        console.print(f"  [cyan]{i}[/cyan]. {s}")
-    sc = _clamp(IntPrompt.ask("Server", default=1), 1, 3)
-    server = ["ollama", "vllm", "other"][sc - 1]
+    for i, s in enumerate(servers, 1):
+        console.print(f"  [green]{i}[/green]. {s}")
+    sc = _clamp(IntPrompt.ask("Server", default=1), 1, len(servers))
+    server = ["ollama", "lmstudio", "vllm", "other"][sc - 1]
 
     cfg = {"model": model_name, "server": server, "preset": preset_name,
            "agents": agents, "panel_enabled": True,

@@ -1,6 +1,5 @@
 """Supported models. Newest first within each company."""
-# any HuggingFace model works via "Other" in the wizard
-# want your model here? open a PR
+# if im missing models open a pr
 
 MODELS = {
     "Qwen": [
