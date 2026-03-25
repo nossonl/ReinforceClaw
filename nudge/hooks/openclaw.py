@@ -17,10 +17,10 @@ MAX_BODY = 1_048_576  # 1MB
 
 
 def _cfg():
+    # reload every time — user might change settings while server runs
     global _config
-    if _config is None:
-        from nudge.cli import load_config
-        _config = load_config()
+    from nudge.cli import load_config
+    _config = load_config()
     return _config
 
 
@@ -39,6 +39,7 @@ def _status_response(self):
     counts = db.count(conn)
     ema, _ = db.get_ema(conn)
     a = db.latest_adapter(conn)
+    trainable = db.count_trainable_untrained(conn)
     conn.close()
     self.send_response(200)
     self.end_headers()
@@ -46,7 +47,7 @@ def _status_response(self):
         "adapter": f"v{a['version']}" if a else "none",
         "ratings": counts["total"],
         "good": counts["good"], "bad": counts["bad"],
-        "untrained": db.count_trainable_untrained(conn),
+        "untrained": trainable,
         "ema": round(ema, 3),
     }).encode())
 

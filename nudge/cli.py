@@ -262,7 +262,7 @@ def cmd_rate(_args, rating=None):
     if not cfg:
         return
     conn = db.connect()
-    pending = db.latest_pending(conn)
+    pending = db.latest_pending(conn, source="cli")
     if pending:
         db.update_feedback_rating(conn, pending["id"], rating)
     else:
