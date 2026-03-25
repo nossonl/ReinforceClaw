@@ -312,13 +312,13 @@ def cmd_train(_args):
         console.print(f"[yellow]Only {n} rated responses. Need at least {batch_min}.[/yellow]")
         conn.close()
         return
-    if n < batch_min * 2:
-        if not Confirm.ask(f"[yellow]{n} ratings — might be weak with so few. Train anyway?[/yellow]"):
+    # only ask for confirmation when human is at the keyboard
+    if sys.stdin.isatty():
+        msg = (f"[yellow]{n} ratings — might be weak with so few. Train anyway?[/yellow]"
+               if n < batch_min * 2 else f"{n} ratings ready. Train now?")
+        if not Confirm.ask(msg):
             conn.close()
             return
-    elif not Confirm.ask(f"{n} ratings ready. Train now?"):
-        conn.close()
-        return
     console.print("[bold]Training...[/bold]")
     metrics = trainer.train(cfg, conn)
     if metrics:
