@@ -1,0 +1,6 @@
+{
+  "name": "nudge-feedback",
+  "version": "0.1.0",
+  "type": "module",
+  "openclaw": { "extensions": ["./src/index.ts"] }
+}

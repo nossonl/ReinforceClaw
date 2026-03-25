@@ -1,16 +1,19 @@
-"""OpenClaw hook. HTTP receiver for TS-side fetch() calls. Run: python -m nudge.hooks.openclaw"""
-# openclaw hooks are TS by default. this python server catches the POSTs.
-# simpler than writing TS — one language for everything.
+"""OpenClaw backend. Receives POSTs from the TS plugin, writes to nudge DB."""
+# the TS plugin (openclaw-plugin/) runs inside the gateway and catches messages
+# from all 23+ platforms. it sends them here. we store, rate, and train.
+# run: python -m nudge.hooks.openclaw
 
 import json
+import subprocess
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from nudge import db
 
-_pending = {}  # session_key → last user message
 _config = None
+_latest_by_session = {}  # session → feedback_id of the last unrated response
 
 
-def _get_config():
+def _cfg():
     global _config
     if _config is None:
         from nudge.cli import load_config
@@ -18,46 +21,84 @@ def _get_config():
     return _config
 
 
+def _maybe_train():
+    """kick off training in background if we have enough ratings"""
+    conn = db.connect()
+    if db.count_trainable_untrained(conn) >= _cfg().get("batch_min", 16):
+        subprocess.Popen(
+            [sys.executable, "-m", "nudge.cli", "train"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    conn.close()
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         path = self.path
 
-        if path == "/feedback/message-in":
-            # user message → stash for pairing
-            _pending[body.get("sessionKey", "")] = body.get("content", "")
-
-        elif path == "/feedback/message-out":
-            # bot response → pair with last user message, ask for rating
-            sk = body.get("sessionKey", "")
-            prompt = _pending.pop(sk, "(openclaw)")
-            response = body.get("content", "")
-            cfg = _get_config()
-            if cfg.get("model") and response:
+        if path == "/feedback/capture":
+            # TS plugin sends prompt+response pair after each bot reply
+            cfg = _cfg()
+            if cfg.get("model"):
                 conn = db.connect()
-                # auto-store as unrated, or let user rate via nudge CLI
-                db.add_feedback(conn, cfg["model"], prompt, response, 0, source="openclaw")
+                fid = db.add_feedback(
+                    conn, cfg["model"],
+                    body.get("prompt", "(openclaw)"),
+                    body.get("response", ""),
+                    0,  # unrated until user scores it
+                    source=body.get("channel", "openclaw"),
+                )
+                _latest_by_session[body.get("sessionKey", "")] = fid
                 conn.close()
 
         elif path == "/feedback/rate":
-            # explicit rating from user (via bot command or UI)
-            conn = db.connect()
-            fid = body.get("feedback_id")
+            # user said /rl good or /rl bad from any platform
+            sk = body.get("sessionKey", "")
             rating = body.get("rating", 0)
+            fid = body.get("feedback_id") or _latest_by_session.pop(sk, None)
             if fid and rating:
+                conn = db.connect()
                 db.update_feedback_rating(conn, fid, rating)
+                conn.close()
+                _maybe_train()
+
+        elif path == "/feedback/status":
+            conn = db.connect()
+            counts = db.count(conn)
+            ema, _ = db.get_ema(conn)
+            a = db.latest_adapter(conn)
             conn.close()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "adapter": f"v{a['version']}" if a else "none",
+                "ratings": counts["total"],
+                "good": counts["good"], "bad": counts["bad"],
+                "untrained": counts["untrained"],
+                "ema": round(ema, 3),
+            }).encode())
+            return
 
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
 
-    def log_message(self, *args):
-        pass  # quiet
+    def do_GET(self):
+        # GET /feedback/status also works
+        if self.path == "/feedback/status":
+            self.do_POST()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *a):
+        pass
 
 
 def run(port=8420):
-    print(f"Nudge OpenClaw receiver on :{port}")
+    print(f"nudge openclaw backend on :{port}")
     HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
