@@ -9,14 +9,14 @@ from pathlib import Path
 from . import db
 
 # lazy — MLX only loaded when you actually train
-mx = nn = optim = mlx_load = LoRALinear = None
+mx = nn = optim = mlx_load = LoRALinear = tree_map = None
 
 
 def _ensure_mlx():
-    global mx, nn, optim, mlx_load, LoRALinear
+    global mx, nn, optim, mlx_load, LoRALinear, tree_map
     if mx is not None:
         return
-    import mlx.core, mlx.nn, mlx.optimizers
+    import mlx.core, mlx.nn, mlx.optimizers, mlx.utils
     from mlx_lm import load
     try:
         from mlx_lm.tuner.lora import LoRALinear as _L  # mlx-lm >= 0.31
@@ -24,6 +24,7 @@ def _ensure_mlx():
         from mlx_lm.tuning.lora import LoRALinear as _L  # older versions
     mx, nn, optim = mlx.core, mlx.nn, mlx.optimizers
     mlx_load, LoRALinear = load, _L
+    tree_map = mlx.utils.tree_map
 
 
 def _adapter_dir():
@@ -33,11 +34,11 @@ def _adapter_dir():
 
 
 def _make_lora(linear, rank):
-    # handle both old (from_linear) and new (from_base) mlx-lm API
-    if hasattr(LoRALinear, "from_linear"):
-        return LoRALinear.from_linear(linear, r=rank)
-    elif hasattr(LoRALinear, "from_base"):
+    # handle both new (from_base) and old (from_linear) mlx-lm API
+    if hasattr(LoRALinear, "from_base"):
         return LoRALinear.from_base(linear, r=rank)
+    elif hasattr(LoRALinear, "from_linear"):
+        return LoRALinear.from_linear(linear, r=rank)
     else:
         return LoRALinear(linear.weight.shape[1], linear.weight.shape[0], r=rank)
 
@@ -205,17 +206,17 @@ def train(config, conn):
             loss, grads = vg(idx)  # NOT vg(policy, idx) — model already captured
             mx.eval(loss)
             acc_loss += loss.item()
-            acc_grads = grads if acc_grads is None else mx.tree_map(
+            acc_grads = grads if acc_grads is None else tree_map(
                 lambda a, b: a + b, acc_grads, grads)
 
-        acc_grads = mx.tree_map(lambda g: g / cfg["grad_accum"], acc_grads)
+        acc_grads = tree_map(lambda g: g / cfg["grad_accum"], acc_grads)
 
         # gradient clipping — no cpu-gpu sync, just multiply (1.0 when under limit)
         flat = [g for _, g in nn.utils.tree_flatten(acc_grads)]
         if flat:
             norm = mx.sqrt(sum(mx.sum(g * g) for g in flat))
             scale = mx.minimum(mx.array(cfg["grad_clip"]) / (norm + 1e-6), mx.array(1.0))
-            acc_grads = mx.tree_map(lambda g: g * scale, acc_grads)
+            acc_grads = tree_map(lambda g: g * scale, acc_grads)
 
         opt.update(policy, acc_grads)
         mx.eval(policy.parameters())
