@@ -117,6 +117,15 @@ def remove_last(conn):
     return dict(row)
 
 
+def recent(conn, limit=20):
+    """Last N ratings for history view."""
+    rows = conn.execute(
+        "SELECT id, prompt, rating, source, created_at FROM feedback "
+        "ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def count(conn):
     row = conn.execute(
         "SELECT COUNT(*) as total, "

@@ -31,7 +31,8 @@ DEFAULTS = {
     "token_clip": [0.5, 2.0], "kl_coeff": 0.001, "lora_rank": 16,
     "grad_accum": 4, "grad_clip": 1.0, "batch_min": 16,
     "replay_ratio": 0.5, "ema_decay": 0.99, "pos_weight": 1.2,
-    "adapter_keep": 0,  # 0 = keep all adapters forever, set a number to auto-cleanup
+    "adapter_keep": 0,  # 0 = keep all adapters forever
+    "train_schedule": "03:00",  # default: train at 3am when batch is ready
 }
 
 from .models import MODELS  # model catalog lives in models.py
@@ -154,6 +155,13 @@ def cmd_init(_args):
     save_config(cfg)
     db.connect().close()  # init tables
     _install_hooks(cfg)
+
+    # set up training schedule
+    from nudge import scheduler
+    schedule = cfg.get("train_schedule", "03:00")
+    if schedule not in ("manual", "auto"):
+        scheduler.install(schedule)
+        console.print(f"[green]Training scheduled daily at {schedule}[/green]")
 
     console.print("\n")
     console.print(Panel(
@@ -363,10 +371,60 @@ def _maybe_train(cfg, conn):
             _swap_latest(cfg, conn)
 
 
+def cmd_history(_args):
+    """Show recent ratings. Type a number to flip its rating."""
+    conn = db.connect()
+    rows = db.recent(conn)
+    if not rows:
+        console.print("[dim]No ratings yet.[/dim]")
+        conn.close()
+        return
+    t = Table(title="Recent Ratings", border_style="green")
+    t.add_column("ID", style="dim")
+    t.add_column("Prompt")
+    t.add_column("Rating")
+    t.add_column("Source")
+    t.add_column("When")
+    for r in rows:
+        label = {"1": "[green]good[/green]", "-1": "[red]bad[/red]", "0": "[dim]unrated[/dim]"}
+        t.add_row(str(r["id"]), r["prompt"][:50], label.get(str(r["rating"]), "?"),
+                  r["source"], r["created_at"])
+    console.print(t)
+    console.print("[dim]To change a rating: nudge rate <id> <good|bad>[/dim]")
+    conn.close()
+
+
+def cmd_rerate(_args):
+    """Change a specific rating: nudge rate 42 good"""
+    if not hasattr(_args, 'id') or not hasattr(_args, 'value'):
+        console.print("Usage: nudge rate <id> <good|bad>")
+        return
+    rating = 1 if _args.value == "good" else -1
+    conn = db.connect()
+    db.update_feedback_rating(conn, int(_args.id), rating)
+    console.print(f"Rating #{_args.id} changed to {'[green]good[/green]' if rating == 1 else '[red]bad[/red]'}")
+    conn.close()
+
+
+def cmd_schedule(_args):
+    """Set training schedule: nudge schedule 03:00 / nudge schedule auto / nudge schedule manual"""
+    from nudge import scheduler
+    cfg = load_config()
+    if hasattr(_args, 'time') and _args.time:
+        cfg["train_schedule"] = _args.time
+        save_config(cfg)
+        scheduler.install(_args.time)
+        console.print(f"[green]Schedule set: {_args.time}[/green]")
+    else:
+        console.print(f"Current: {cfg.get('train_schedule', '03:00')}")
+        console.print("[dim]nudge schedule 03:00 / auto / manual[/dim]")
+
+
 COMMANDS = {
     "init": cmd_init, "good": lambda a: cmd_rate(a, 1), "bad": lambda a: cmd_rate(a, -1),
     "undo": cmd_undo, "train": cmd_train, "status": cmd_status,
     "rollback": cmd_rollback, "reset": cmd_reset, "on": cmd_on, "off": cmd_off,
+    "history": cmd_history, "schedule": cmd_schedule,
 }
 
 
@@ -374,11 +432,24 @@ def main():
     parser = argparse.ArgumentParser(prog="nudge", description="Personal RL for AI agents")
     sub = parser.add_subparsers(dest="command")
     for name in COMMANDS:
+        if name in ("rate", "schedule"):
+            continue  # these have custom args, added below
         sub.add_parser(name)
+
+    # nudge rate <id> <good|bad>
+    rate_p = sub.add_parser("rate", help="Change a rating: nudge rate 42 good")
+    rate_p.add_argument("id")
+    rate_p.add_argument("value", choices=["good", "bad"])
+
+    # nudge schedule <time>
+    sched_p = sub.add_parser("schedule", help="Set training schedule")
+    sched_p.add_argument("time", nargs="?")
+
     args = parser.parse_args()
-    handler = COMMANDS.get(args.command)
-    if handler:
-        handler(args)
+    if args.command == "rate":
+        cmd_rerate(args)
+    elif args.command in COMMANDS:
+        COMMANDS[args.command](args)
     else:
         parser.print_help()
 

@@ -31,6 +31,9 @@ def queue_training():
 
 
 def maybe_train(conn, config):
-    """Kick off training if batch threshold met."""
+    """Train now if schedule=auto and batch ready. Otherwise the scheduler handles it."""
+    schedule = config.get("train_schedule", "03:00")
+    if schedule != "auto":
+        return  # scheduled training handles it, don't train in the hook
     if db.count_trainable_untrained(conn) >= config.get("batch_min", 16):
         queue_training()
