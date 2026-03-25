@@ -1,6 +1,7 @@
 """Terminal feedback panel. Opens /dev/tty directly so it works inside hook subprocesses."""
 # hooks get stdin piped from the parent process (JSON), so sys.stdin is NOT a terminal.
 # we bypass that entirely by opening /dev/tty — the real terminal — for keypress reads.
+# NO TIMERS. panel stays until you press something or start typing. your call.
 
 import os
 import sys
@@ -17,16 +18,15 @@ def _open_tty():
         return None
 
 
-def _raw_read(fd: int, timeout=0.1) -> Optional[str]:
-    """One keypress from the real terminal. None on timeout."""
+def _raw_read(fd: int) -> Optional[str]:
+    """One keypress from the real terminal. Waits forever."""
     import termios, tty
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        ready, _, _ = select.select([fd], [], [], timeout)
-        if not ready:
-            return None
-        return os.read(fd, 3).decode("utf-8", errors="ignore")
+        # blocks until a key is pressed. no timeout. take your time.
+        ch = os.read(fd, 3).decode("utf-8", errors="ignore")
+        return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
@@ -46,26 +46,19 @@ def _clear_panel():
     sys.stderr.flush()
 
 
-def collect_rating(timeout_s=30) -> Optional[int]:
-    """Show panel, read one key. Returns +1, -1, or None."""
+def collect_rating() -> Optional[int]:
+    """Show panel, wait for a key. No timer. Returns +1, -1, or None."""
     fd = _open_tty()
     if fd is None:
         return None
 
-    steps = max(1, int(timeout_s / 0.1))
     sys.stderr.write(PANEL)
     sys.stderr.flush()
     try:
-        for _ in range(steps):
-            key = _raw_read(fd, 0.1)
-            if key is None:
-                continue
-            if key.startswith("\x1b"):
-                _clear_panel()
-                return None
-            _clear_panel()
-            return _KEYS.get(key)
+        key = _raw_read(fd)
+        _clear_panel()
+        if key is None or key.startswith("\x1b"):
+            return None  # escape or arrow = skip
+        return _KEYS.get(key)  # 1=good, 2=bad, 3/anything else=skip
     finally:
         os.close(fd)
-    _clear_panel()
-    return None

@@ -73,7 +73,7 @@ def handle_stop():
 
     if config.get("panel_enabled", True):
         from nudge.feedback import collect_rating
-        rating = collect_rating(timeout_s=10)  # short timeout — don't freeze claude
+        rating = collect_rating()  # no timer — rate whenever you're ready
         if isinstance(rating, int):
             db.update_feedback_rating(conn, current_id, rating)
             if _trainable_untrained(conn) >= config.get("batch_min", 16):

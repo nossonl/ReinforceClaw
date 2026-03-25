@@ -15,7 +15,7 @@ except ImportError:
 if discord is not None:
     class FeedbackView(discord.ui.View):
         def __init__(self, model, prompt, response):
-            super().__init__(timeout=3600)
+            super().__init__(timeout=None)  # stays until clicked or ignored
             self.model, self.prompt, self.response = model, prompt, response
 
         def _record(self, rating):

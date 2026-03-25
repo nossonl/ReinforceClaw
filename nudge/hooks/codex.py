@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Codex desktop app hook. Two small circles under each response."""
-# two empty circles with black outlines. press one → fills green → records to db → disappears.
-# press again on a filled one → unfills and disappears. don't press either → stays, gets skipped.
+# two circles with black outlines. click left → green (good). click right → red (bad).
+# click a filled one again → goes back to empty (undo). circles never disappear.
 
 import json
 import sys
@@ -29,16 +29,23 @@ def _show_buttons(feedback_id, config):
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"80x32+{sw // 2 - 40}+{sh - 70}")
 
-    selected = [None]  # track which is filled
+    selected = [None]  # None = nothing picked yet
+    colors = {1: "#22c55e", -1: "#ef4444"}  # green for good, red for bad
 
-    def _click(canvas, oval, rating):
+    def _click(canvas, oval, other_canvas, other_oval, rating):
         if selected[0] == rating:
-            # already filled — unfill and dismiss
-            root.destroy()
+            # already filled — undo it, go back to empty
+            canvas.itemconfig(oval, fill="")
+            conn = db.connect()
+            db.update_feedback_rating(conn, feedback_id, 0)
+            conn.close()
+            selected[0] = None
             return
-        # fill green, record, dismiss
-        canvas.itemconfig(oval, fill="#22c55e")
-        canvas.update()
+
+        # fill this one, unfill the other
+        canvas.itemconfig(oval, fill=colors[rating])
+        other_canvas.itemconfig(other_oval, fill="")
+
         conn = db.connect()
         db.update_feedback_rating(conn, feedback_id, rating)
         if db.count_trainable_untrained(conn) >= config.get("batch_min", 16):
@@ -46,18 +53,22 @@ def _show_buttons(feedback_id, config):
             _queue_training(config)
         conn.close()
         selected[0] = rating
-        root.after(300, root.destroy)  # brief flash so you see the green
 
     bg = root.cget("bg")
     frame = tk.Frame(root, bg=bg)
     frame.pack(expand=True)
 
-    # two empty circles, black outline, no fill
-    for rating in (1, -1):
-        c = tk.Canvas(frame, width=24, height=24, bg=bg, highlightthickness=0, cursor="hand2")
-        oval = c.create_oval(2, 2, 22, 22, fill="", outline="black", width=2)
-        c.bind("<Button-1>", lambda e, cv=c, ov=oval, r=rating: _click(cv, ov, r))
-        c.pack(side="left", padx=4)
+    # left circle = good, right circle = bad
+    c1 = tk.Canvas(frame, width=24, height=24, bg=bg, highlightthickness=0, cursor="hand2")
+    o1 = c1.create_oval(2, 2, 22, 22, fill="", outline="black", width=2)
+    c1.pack(side="left", padx=4)
+
+    c2 = tk.Canvas(frame, width=24, height=24, bg=bg, highlightthickness=0, cursor="hand2")
+    o2 = c2.create_oval(2, 2, 22, 22, fill="", outline="black", width=2)
+    c2.pack(side="left", padx=4)
+
+    c1.bind("<Button-1>", lambda e: _click(c1, o1, c2, o2, 1))
+    c2.bind("<Button-1>", lambda e: _click(c2, o2, c1, o1, -1))
 
     root.mainloop()
 
@@ -79,7 +90,6 @@ def handle_stop():
     fid = db.add_feedback(conn, config["model"], "(codex)", last_msg, 0, source="hook")
     conn.close()
 
-    # buttons in a thread so hook doesn't block codex
     t = threading.Thread(target=_show_buttons, args=(fid, config), daemon=True)
     t.start()
 
