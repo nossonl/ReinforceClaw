@@ -4,7 +4,9 @@
 
 import os
 import sys
-from typing import Optional
+from typing import Optional, Literal
+
+UNAVAILABLE = "unavailable"
 
 _KEYS = {"1": 1, "2": -1, "3": None}
 
@@ -27,17 +29,17 @@ PANEL = (
 
 
 def _clear_panel():
-    sys.stderr.write("\033[7A\033[J")  # 7 lines now (removed arrow row)
+    sys.stderr.write(f"\033[{PANEL.count(chr(10))}A\033[J")
     sys.stderr.flush()
 
 
-def collect_rating() -> Optional[int]:
-    """Show panel, wait for keypress. Returns +1, -1, or None."""
+def collect_rating() -> Optional[int] | Literal["unavailable"]:
+    """Show panel, wait for keypress. Returns +1, -1, None, or unavailable."""
     fd = _open_tty()
     if fd is None:
         sys.stderr.write("reinforceclaw: panel unavailable; use /good or /bad.\n")
         sys.stderr.flush()
-        return None
+        return UNAVAILABLE
 
     sys.stderr.write(PANEL)
     sys.stderr.flush()

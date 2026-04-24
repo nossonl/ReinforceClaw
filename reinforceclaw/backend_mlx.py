@@ -7,6 +7,8 @@ import os
 import subprocess
 from dataclasses import dataclass
 
+_PAGE_SIZE = None
+
 
 def _sysctl_int(name: str) -> int | None:
     try:
@@ -17,8 +19,10 @@ def _sysctl_int(name: str) -> int | None:
 
 
 def _available_bytes() -> int | None:
+    global _PAGE_SIZE
     try:
-        page_size = _sysctl_int("hw.pagesize") or 4096
+        if _PAGE_SIZE is None:
+            _PAGE_SIZE = _sysctl_int("hw.pagesize") or 4096
         out = subprocess.check_output(["vm_stat"], text=True)
         wanted = {"Pages free", "Pages inactive", "Pages speculative"}
         pages = 0
@@ -28,7 +32,7 @@ def _available_bytes() -> int | None:
             key, value = line.split(":", 1)
             if key.strip() in wanted:
                 pages += int(value.strip().rstrip("."))
-        return pages * page_size
+        return pages * _PAGE_SIZE
     except Exception:
         return None
 
@@ -129,6 +133,9 @@ class MLXBackend:
         gc.collect()
         self.clear_cache()
         self.synchronize()
+
+    def preferred_dtype(self):
+        return None
 
     def synchronize(self) -> None:
         try:

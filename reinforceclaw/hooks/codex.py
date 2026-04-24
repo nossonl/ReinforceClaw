@@ -4,34 +4,30 @@
 # click filled one again → unfills (undo). X closes the circles.
 # circles reappear after every response. prompt hook also supports /good and /bad.
 
-import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from reinforceclaw import db
-from reinforceclaw.hooks._common import load_config, maybe_train, read_stdin
+from reinforceclaw.hooks._common import (
+    load_config, maybe_train, pending_context, pop_pending, read_stdin, save_pending,
+    last_msg_from, training_context, handle_agent_command,
+)
 
 SOURCE = "codex"
-COMMANDS = {
-    "/rl good": "good", "/rl bad": "bad", "/rl undo": "undo",
-    "/rl train": "train", "/rl status": "status",
-    "/rl rollback": "rollback", "/rl reset": "reset",
-    "/rl on": "on", "/rl off": "off",
-    "/rc good": "good", "/rc bad": "bad", "/rc undo": "undo",
-    "/rc train": "train", "/rc status": "status",
-    "/rc rollback": "rollback", "/rc reset": "reset",
-    "/rc on": "on", "/rc off": "off",
-    "/reinforceclaw good": "good", "/reinforceclaw bad": "bad",
-    "/reinforceclaw undo": "undo", "/reinforceclaw train": "train",
-    "/reinforceclaw status": "status", "/reinforceclaw rollback": "rollback",
-    "/reinforceclaw reset": "reset", "/reinforceclaw on": "on", "/reinforceclaw off": "off",
-    "/good": "good", "/bad": "bad",
-}
+PANEL_LOG_PATH = Path.home() / ".reinforceclaw" / "panel.log"
 
 
-def _show_buttons(feedback_id, config):
+def _panel_log(message):
+    db.secure_private_dir(PANEL_LOG_PATH.parent)
+    fd = os.open(PANEL_LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as log:
+        log.write(message.rstrip() + "\n")
+
+
+def _show_buttons(key, config):
     import tkinter as tk
 
     root = tk.Tk()
@@ -53,18 +49,26 @@ def _show_buttons(feedback_id, config):
     def _click(canvas, oval, other_canvas, other_oval, rating):
         if selected[0] == rating:
             canvas.itemconfig(oval, fill="")
-            conn = db.connect()
-            db.update_feedback_rating(conn, feedback_id, 0)
-            conn.close()
+            pop_pending(SOURCE, key)
             selected[0] = None
+            return
+        pending = pop_pending(SOURCE, key)
+        if not pending:
+            _panel_log(f"pending {key} already consumed")
+            root.destroy()
             return
         canvas.itemconfig(oval, fill=colors[rating])
         other_canvas.itemconfig(other_oval, fill="")
         conn = db.connect()
-        db.update_feedback_rating(conn, feedback_id, rating)
+        db.add_feedback(
+            conn, pending["model"], pending["prompt"], pending["response"], rating,
+            context=pending.get("context"), source=SOURCE, event_id=pending.get("key"),
+            rollout_context=pending.get("rollout_context"),
+        )
         maybe_train(conn, config)
         conn.close()
         selected[0] = rating
+        root.destroy()
 
     bg = root.cget("bg")
     frame = tk.Frame(root, bg=bg)
@@ -79,13 +83,18 @@ def _show_buttons(feedback_id, config):
     c2.pack(side="left", padx=3)
 
     # X button to dismiss
+    def _dismiss():
+        pop_pending(SOURCE, key)
+        root.destroy()
+
     close = tk.Label(frame, text="✕", font=("Arial", 10), fg="gray", bg=bg, cursor="hand2")
     close.pack(side="left", padx=3)
-    close.bind("<Button-1>", lambda e: root.destroy())
+    close.bind("<Button-1>", lambda e: _dismiss())
 
     c1.bind("<Button-1>", lambda e: _click(c1, o1, c2, o2, 1))
     c2.bind("<Button-1>", lambda e: _click(c2, o2, c1, o1, -1))
 
+    root.after(300000, _dismiss)
     root.mainloop()
 
 
@@ -95,83 +104,48 @@ def handle_stop():
     if not config.get("model"):
         return
 
-    last_msg = data.get("last_assistant_message", "")
+    last_msg = data.get("last_assistant_message", "") or last_msg_from(data, "assistant")
     if not last_msg:
         return
 
-    conn = db.connect()
-    fid = db.add_feedback(conn, config["model"], "(codex)", last_msg, 0, source=SOURCE)
-    conn.close()
+    prompt = last_msg_from(data, "user") or "(codex)"
+    key = save_pending(
+        SOURCE, config["model"], prompt, last_msg,
+        context=pending_context(data), rollout_context=training_context(data, prompt, last_msg),
+    )
     if not config.get("panel_enabled", True):
         return
 
-    subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "panel", str(fid)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    db.secure_private_dir(PANEL_LOG_PATH.parent)
+    fd = os.open(PANEL_LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    log = os.fdopen(fd, "a", encoding="utf-8")
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "panel", key],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        log.write(f"panel spawn error: {type(exc).__name__}: {exc}\n")
+    finally:
+        log.close()
 
 
 def handle_prompt():
-    data = read_stdin()
-    prompt_obj = data.get("prompt", {})
-    prompt = prompt_obj.get("content", "").strip() if isinstance(prompt_obj, dict) else str(prompt_obj).strip()
-    cmd = COMMANDS.get(" ".join(prompt.lower().split()))
-    if cmd is None:
-        sys.exit(0)
-
-    config = load_config()
-    conn = db.connect()
-    if cmd in ("good", "bad"):
-        if not config.get("model"):
-            conn.close()
-            print(json.dumps({"result": "block", "reason": "reinforceclaw not initialized"}))
-            return
-        rating = 1 if cmd == "good" else -1
-        pending = db.latest_pending(conn, source=SOURCE)
-        if pending:
-            db.update_feedback_rating(conn, pending["id"], rating)
-        else:
-            last_msg = data.get("last_assistant_message", "(from codex)")
-            db.add_feedback(conn, config["model"], "(from codex)", last_msg, rating, source=SOURCE)
-        maybe_train(conn, config)
-    elif cmd == "undo":
-        db.remove_last(conn)
-    elif cmd == "train":
-        from reinforceclaw.hooks._common import queue_training
-        queue_training()
-    elif cmd == "status":
-        pass
-    elif cmd == "rollback":
-        prev = db.rollback(conn)
-        if prev:
-            from reinforceclaw import trainer
-            trainer.hot_swap(config.get("server", "ollama"), prev["path"], config.get("model", ""))
-    elif cmd == "reset":
-        from reinforceclaw.cli import reset_state
-        conn.close()
-        reset_state()
-        print(json.dumps({"result": "block", "reason": f"reinforceclaw: /rl {cmd}"}))
-        return
-    elif cmd == "on":
-        config["panel_enabled"] = True
-        from reinforceclaw.cli import save_config
-        save_config(config)
-    elif cmd == "off":
-        config["panel_enabled"] = False
-        from reinforceclaw.cli import save_config
-        save_config(config)
-
-    conn.close()
-    print(json.dumps({"result": "block", "reason": f"reinforceclaw: /rl {cmd}"}))
+    handle_agent_command(SOURCE, read_stdin())
 
 
 def handle_panel():
     if len(sys.argv) < 3:
         return
-    _show_buttons(int(sys.argv[2]), load_config())
+    key = sys.argv[2]
+    try:
+        _show_buttons(key, load_config())
+    except Exception as exc:
+        _panel_log(f"panel error: {type(exc).__name__}: {exc}")
+        return
 
 
 if __name__ == "__main__":

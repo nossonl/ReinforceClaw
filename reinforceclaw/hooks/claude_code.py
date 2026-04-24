@@ -1,140 +1,59 @@
 #!/usr/bin/env python3
 """Claude Code hooks. Stop hook + /rl command interceptor."""
-# stop hook: fires after each assistant turn. records turn, shows panel, queues training.
+# stop hook: fires after each assistant turn. shows panel, saves only rated turns.
 # prompt hook: intercepts /rl commands before claude sees them.
 # stdout goes back to claude code — only print the final JSON response.
 
-import json
 import sys
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from reinforceclaw import db
-from reinforceclaw.hooks._common import load_config, read_stdin, maybe_train
+from reinforceclaw.hooks._common import (
+    load_config, read_stdin, maybe_train, pending_context, pop_pending, save_pending,
+    last_msg_from, training_context, handle_agent_command,
+)
 
 SOURCE = "claude_code"
-COMMANDS = {
-    "/rl good": "good", "/rl bad": "bad", "/rl undo": "undo",
-    "/rl train": "train", "/rl status": "status",
-    "/rl rollback": "rollback", "/rl reset": "reset",
-    "/rl on": "on", "/rl off": "off",
-    "/rc good": "good", "/rc bad": "bad", "/rc undo": "undo",
-    "/rc train": "train", "/rc status": "status",
-    "/rc rollback": "rollback", "/rc reset": "reset",
-    "/rc on": "on", "/rc off": "off",
-    "/reinforceclaw good": "good", "/reinforceclaw bad": "bad",
-    "/reinforceclaw undo": "undo", "/reinforceclaw train": "train",
-    "/reinforceclaw status": "status", "/reinforceclaw rollback": "rollback",
-    "/reinforceclaw reset": "reset", "/reinforceclaw on": "on", "/reinforceclaw off": "off",
-    "/good": "good", "/bad": "bad",
-}
-
-
-def _last_msg_from(data, role):
-    """Pull the last message of a given role from hook data."""
-    for m in reversed(data.get("messages", [])):
-        if m.get("role") == role:
-            return m.get("content", "")
-    return ""
 
 
 def handle_stop():
-    data = read_stdin()
-    config = load_config()
-    if not config.get("model"):
-        return
+    conn = None
+    try:
+        data = read_stdin()
+        config = load_config()
+        if not config.get("model"):
+            return
 
-    last_msg = data.get("last_assistant_message", "") or _last_msg_from(data, "assistant")
-    if not last_msg:
-        return
+        last_msg = data.get("last_assistant_message", "") or last_msg_from(data, "assistant")
+        if not last_msg:
+            return
 
-    prompt = _last_msg_from(data, "user")
-    conn = db.connect()
-    fid = db.add_feedback(conn, config["model"], prompt, last_msg, 0, source=SOURCE)
-
-    if config.get("panel_enabled", True):
+        prompt = last_msg_from(data, "user")
+        context = pending_context(data)
+        rollout = training_context(data, prompt, last_msg)
+        key = save_pending(SOURCE, config["model"], prompt, last_msg, context=context, rollout_context=rollout)
+        if not config.get("panel_enabled", True):
+            return
         from reinforceclaw.feedback import collect_rating
         rating = collect_rating()
         if isinstance(rating, int):
-            db.update_feedback_rating(conn, fid, rating)
+            conn = db.connect()
+            db.add_feedback(conn, config["model"], prompt, last_msg, rating, context=context, source=SOURCE, event_id=key, rollout_context=rollout)
             maybe_train(conn, config)
-
-    conn.close()
+            pop_pending(SOURCE, key, context=context)
+        elif rating is None:
+            pop_pending(SOURCE, key, context=context)
+    except Exception as exc:
+        sys.stderr.write(f"reinforceclaw hook error: {type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def handle_prompt():
-    data = read_stdin()
-
-    # claude code sends prompt as {"content": "...", "type": "user"}
-    prompt_obj = data.get("prompt", {})
-    prompt = prompt_obj.get("content", "").strip() if isinstance(prompt_obj, dict) else str(prompt_obj).strip()
-
-    normalized = " ".join(prompt.lower().split())
-    cmd = COMMANDS.get(normalized)
-    if cmd is None:
-        sys.exit(0)
-
-    config = load_config()
-    conn = db.connect()
-
-    if cmd in ("good", "bad"):
-        if not config.get("model"):
-            sys.stderr.write("Run reinforceclaw init first.\n")
-            conn.close()
-            print(json.dumps({"result": "block", "reason": "reinforceclaw not initialized"}))
-            return
-        rating = 1 if cmd == "good" else -1
-        pending = db.latest_pending(conn, source=SOURCE)
-        if pending:
-            db.update_feedback_rating(conn, pending["id"], rating)
-        else:
-            last_msg = data.get("last_assistant_message", "(from chat)")
-            db.add_feedback(conn, config["model"], "(from chat)", last_msg, rating, source=SOURCE)
-        label = "\033[32mgood\033[0m" if rating == 1 else "\033[31mbad\033[0m"
-        sys.stderr.write(f"Rated: {label}\n")
-        maybe_train(conn, config)
-    elif cmd == "undo":
-        r = db.remove_last(conn)
-        sys.stderr.write("\033[33mRemoved last rating\033[0m\n" if r else "Nothing to undo.\n")
-    elif cmd == "train":
-        from reinforceclaw.hooks._common import queue_training
-        queue_training()
-        sys.stderr.write("Training started in background.\n")
-    elif cmd == "status":
-        counts = db.count(conn)
-        ema, _ = db.get_ema(conn)
-        a = db.latest_adapter(conn)
-        sys.stderr.write(
-            f"Adapter: {'v'+str(a['version']) if a else 'none'} | "
-            f"Ratings: {counts['total']} ({counts['good']}+ {counts['bad']}-) | "
-            f"Untrained: {db.count_trainable_untrained(conn)} | EMA: {ema:.3f}\n")
-    elif cmd == "rollback":
-        prev = db.rollback(conn)
-        if prev:
-            from reinforceclaw import trainer
-            trainer.hot_swap(config.get("server", "ollama"), prev["path"], config.get("model", ""))
-        sys.stderr.write(f"\033[32mRolled back to v{prev['version']}\033[0m\n" if prev
-                         else "No previous adapter.\n")
-    elif cmd == "reset":
-        from reinforceclaw.cli import reset_state
-        conn.close()
-        reset_state()
-        sys.stderr.write("\033[32mReset complete.\033[0m\n")
-        print(json.dumps({"result": "block", "reason": f"reinforceclaw: /rl {cmd}"}))
-        return
-    elif cmd == "on":
-        config["panel_enabled"] = True
-        from reinforceclaw.cli import save_config
-        save_config(config)
-        sys.stderr.write("\033[32mPanel on.\033[0m\n")
-    elif cmd == "off":
-        config["panel_enabled"] = False
-        from reinforceclaw.cli import save_config
-        save_config(config)
-        sys.stderr.write("\033[33mPanel off.\033[0m\n")
-
-    conn.close()
-    print(json.dumps({"result": "block", "reason": f"reinforceclaw: /rl {cmd}"}))
+    handle_agent_command(SOURCE, read_stdin(), sys.stderr.write)
 
 
 if __name__ == "__main__":

@@ -13,40 +13,49 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.table import Table
 
-from . import db, trainer
-from . import collect
+from . import db, trainer, presets, profile
+from .hooks._common import pop_pending
 
 console = Console()
 CONFIG_PATH = Path.home() / ".reinforceclaw" / "config.json"
 ADAPTER_ROOT = Path.home() / ".reinforceclaw" / "adapters"
+OPENCLAW_BRIDGE_CONFIG = Path.home() / ".reinforceclaw" / "openclaw_bridge.json"
+TRAIN_RETRY_PATH = Path.home() / ".reinforceclaw" / "train.retry"
+RESET_MARK_PATH = Path.home() / ".reinforceclaw" / "reset.marker"
 
 PRESETS = {
-    "careful":    {"lr": 6e-6, "traj_clip": [0.996, 1.001], "steps": 3,
-                   "desc": "Small safest updates."},
-    "balanced":   {"lr": 8e-6, "traj_clip": [0.996, 1.001], "steps": 4,
-                   "desc": "Best current stable MIS-PO default."},
-    "aggressive": {"lr": 9e-6, "traj_clip": [0.994, 1.003], "steps": 5,
-                   "desc": "Faster drift. More overfit risk."},
+    "careful": "Safest updates. Highest KL, slowest drift.",
+    "balanced": "Stable MIS-PO default. Sweep winner.",
+    "aggressive": "Faster drift. More overfit risk.",
 }
 
 DEFAULTS = {
     "loss_fn": "mis-po",
     "lora_target": "attention",
-    "token_clip": [0.5, 2.0], "kl_coeff": 0.08, "lora_rank": 16,
-    "grad_accum": 1, "grad_clip": 1.0, "batch_min": 24, "batch_size": 4,
-    "replay_ratio": 0.25, "ema_decay": 0.99, "pos_weight": 1.0,
+    "token_clip": [0.5, 2.0], "kl_coeff": 0.001, "lora_rank": 16,
+    "grad_accum": 2, "grad_clip": 1.0, "batch_min": 32, "batch_size": 4,
+    "replay_ratio": 0.0, "ema_decay": 0.99, "pos_weight": 1.2,
     "adv_clip": 2.0, "max_passes": 1.0,
     "pressure_retry_limit": 2, "pressure_cooldown_s": 3.0,
     "background_slice_steps": 2,
-    "publish_gate_enabled": True, "publish_gate_max_drop": 0,
     "adapter_keep": 0,  # 0 = keep all adapters forever
-    "train_schedule": "03:00",
+    "train_schedule": "auto",
     "schedule_window_minutes": 180,
+    # speed-up knobs (opt-in; 0/None = disabled so validated baseline stands).
+    "lora_plus_ratio": 0.0,    # B-matrix LR multiplier; ~16 roughly doubles convergence
+    "use_liger": False,        # Liger-Kernel fused CE + RMSNorm (CUDA)
+    "compile_backend": "none", # "reduce-overhead" | "max-autotune" | "default" (CUDA)
+    "mlx_compile": False,      # mx.compile on MLX loss_fn
+    "lora_init": "default",    # "pissa" | "olora" | "loftq" | "eva" — PEFT init recipe
+    "sdpa_backend": "auto",    # PyTorch SDPA hint; "auto" lets torch pick FA4 on Blackwell
+    "trust_remote_code": False,
 }
+_PROFILE_CACHE = {}
 
 from .models import MODELS  # model catalog lives in models.py
 
@@ -58,19 +67,68 @@ LOGO = r"""
  / /|  / /_/ / /_/ / /_/ /  __/
 /_/ |_/\__,_/\__,_/\__, /\___/
                   /____/
-[/bold green]
-[dim]# ai designed this lol[/dim]"""
+[/bold green]"""
+
+
+def _read_json(path, default=None):
+    if not path.exists():
+        return {} if default is None else default
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {} if default is None else default
+
+
+def _read_config():
+    return _read_json(CONFIG_PATH)
+
+
+_TUNED_KEYS = ("lr", "traj_clip", "steps", "kl_coeff", "lora_rank", "lora_alpha",
+               "lora_target", "batch_min", "batch_size", "grad_accum", "pos_weight",
+               "replay_ratio", "token_clip")
+
+
+def _auto_tuned_values(cfg: dict) -> dict:
+    model, preset = cfg.get("model", ""), cfg.get("preset", "balanced")
+    mp = cfg.get("model_profile") if cfg.get("model_profile_model") == model else None
+    try:
+        if isinstance(mp, dict):
+            prof = profile.ModelProfile(**mp)
+        else:
+            prof = _PROFILE_CACHE.get(model) or profile.detect(model)
+            _PROFILE_CACHE[model] = prof
+    except TypeError:
+        prof = _PROFILE_CACHE.get(model) or profile.detect(model)
+        _PROFILE_CACHE[model] = prof
+    tuned = presets.pick(prof, preset)
+    tuned["model_profile_model"] = model
+    return tuned
+
+
+def _resolve_config(cfg: dict) -> dict:
+    if not cfg or cfg.get("tuning_mode") == "custom" or not cfg.get("model"):
+        return cfg
+    tuned = _auto_tuned_values(cfg)
+    resolved = dict(cfg)
+    for key in _TUNED_KEYS:
+        if key in tuned:
+            resolved[key] = tuned[key]
+    resolved["model_profile"] = tuned["model_profile"]
+    resolved["model_profile_model"] = tuned["model_profile_model"]
+    resolved["tuning_mode"] = "auto"
+    return resolved
 
 
 def load_config():
-    if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text())
-    return {}
+    cfg = _read_config()
+    resolved = _resolve_config(cfg)
+    if resolved != cfg and resolved.get("tuning_mode") == "auto":
+        save_config(resolved)
+    return resolved
 
 
 def save_config(cfg):
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+    _write_json_atomic(CONFIG_PATH, cfg)
 
 
 def _clamp(val, lo, hi):
@@ -89,38 +147,9 @@ def _trainable_untrained(conn):
     return db.count_trainable_untrained(conn)
 
 
-def _server_base_url(server, cfg, prefix="server"):
-    key = f"{prefix}_base_url"
-    if cfg.get(key):
-        return cfg[key]
-    env_key = f"REINFORCECLAW_{prefix.upper()}_BASE_URL"
-    if os.environ.get(env_key):
-        return os.environ[env_key]
-    if prefix == "server" and cfg.get("base_url"):
-        return cfg["base_url"]
-    defaults = {
-        "ollama": "http://localhost:11434",
-        "lmstudio": "http://localhost:1234/v1",
-        "vllm": "http://localhost:8000/v1",
-        "other": "",
-        "openai": "http://localhost:8000/v1",
-    }
-    return defaults.get(server, "")
-
-
-def _api_key(value, prefix):
-    if value:
-        return value
-    return os.environ.get(f"REINFORCECLAW_{prefix.upper()}_API_KEY")
-
-
-def _ollama_target_model(model_name, latest):
-    return f"{model_name}-reinforceclaw" if latest else model_name
-
-
 def _swap_latest(cfg, conn):
     latest = db.latest_adapter(conn)
-    return latest and trainer.hot_swap(cfg.get("server", "ollama"), latest["path"], cfg["model"])
+    return latest and trainer.load_adapter(cfg.get("server", "ollama"), latest["path"], cfg.get("serve_model") or cfg["model"])
 
 
 def _record_background_event(conn, kind):
@@ -152,13 +181,62 @@ def _set_panel(enabled):
     console.print("[green]Panel on.[/green]" if enabled else "[yellow]Panel off.[/yellow] Use /rl good or /rl bad.")
 
 
+def _write_json_atomic(path, payload, *, backup=False):
+    db.secure_private_dir(path.parent)
+    if backup and path.exists():
+        shutil.copy2(path, path.with_name(f"{path.name}.bak"))
+    tmp = path.with_name(f".{path.name}.{os.getpid()}-{os.urandom(4).hex()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _write_text_atomic(path, text, *, backup=False):
+    db.secure_private_dir(path.parent)
+    if backup and path.exists():
+        shutil.copy2(path, path.with_name(f"{path.name}.bak"))
+    tmp = path.with_name(f".{path.name}.{os.getpid()}-{os.urandom(4).hex()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _write_private_json(path, payload):
+    _write_json_atomic(path, payload)
+
+
 def reset_state():
-    conn = db.connect()
+    lock_fd = trainer._acquire_lock()
+    if lock_fd is None:
+        raise RuntimeError("training is running; try again when the current update finishes")
     try:
-        db.reset_all(conn)
+        conn = db.connect()
+        try:
+            db.reset_all(conn)
+        finally:
+            conn.close()
+        shutil.rmtree(ADAPTER_ROOT, ignore_errors=True)
+        shutil.rmtree(Path.home() / ".reinforceclaw" / "pending", ignore_errors=True)
+        TRAIN_RETRY_PATH.unlink(missing_ok=True)
+        _write_private_json(RESET_MARK_PATH, {"reset_at": datetime.now().isoformat()})
     finally:
-        conn.close()
-    shutil.rmtree(ADAPTER_ROOT, ignore_errors=True)
+        trainer._release_lock(lock_fd)
+
+
+def rollback_adapter(conn, cfg, version=None):
+    lock_fd = trainer._acquire_lock()
+    if lock_fd is None:
+        return None, "training is running; try again when the current update finishes"
+    try:
+        prev = db.rollback_to(conn, version) if version is not None else db.rollback(conn)
+        if prev:
+            trainer.load_adapter(cfg.get("server", "ollama"), prev["path"], cfg.get("serve_model") or cfg.get("model", ""))
+        return prev, None
+    finally:
+        trainer._release_lock(lock_fd)
 
 
 # -- setup wizard --
@@ -198,18 +276,20 @@ def cmd_init(_args):
 
     # preset
     console.print("\n[bold]Training preset:[/bold]")
-    for i, (name, info) in enumerate(PRESETS.items(), 1):
-        console.print(f"  [green]{i}[/green]. [bold]{name}[/bold] — {info['desc']}")
+    for i, (name, desc) in enumerate(PRESETS.items(), 1):
+        console.print(f"  [green]{i}[/green]. [bold]{name}[/bold] — {desc}")
     console.print(f"  [green]4[/green]. [bold]custom[/bold] — set your own learning rate and steps")
     pc = _clamp(IntPrompt.ask("Preset", default=2), 1, 4)
     if pc <= 3:
         preset_name = list(PRESETS.keys())[pc - 1]
-        preset = PRESETS[preset_name]
+        tuning_mode = "auto"
+        custom_overrides = {}
     else:
-        preset_name = "custom"
-        lr = float(Prompt.ask("Learning rate", default="3e-6"))
-        steps = IntPrompt.ask("Steps per round", default=3)
-        preset = {"lr": lr, "traj_clip": [0.996, 1.001], "steps": steps}
+        preset_name = "balanced"
+        lr = float(Prompt.ask("Learning rate", default="5e-6"))
+        steps = IntPrompt.ask("Steps per round", default=32)
+        tuning_mode = "custom"
+        custom_overrides = {"lr": lr, "steps": steps, "traj_clip": [0.996, 1.001]}
 
     # server
     servers = ["Ollama", "LM Studio", "vLLM", "Other"]
@@ -218,27 +298,39 @@ def cmd_init(_args):
         console.print(f"  [green]{i}[/green]. {s}")
     sc = _clamp(IntPrompt.ask("Server", default=1), 1, len(servers))
     server = ["ollama", "lmstudio", "vllm", "other"][sc - 1]
+    serve_model = None
+    if server == "ollama":
+        serve_model = Prompt.ask(
+            "Ollama base model/tag to attach the adapter to",
+            default=model_name,
+        ).strip()
 
     cfg = {"model": model_name, "server": server, "preset": preset_name,
            "agents": agents, "panel_enabled": True,
-           "lr": preset["lr"], "traj_clip": preset["traj_clip"],
-           "steps": preset["steps"], **DEFAULTS}
+           "tuning_mode": tuning_mode, **DEFAULTS, **custom_overrides}
+    if serve_model:
+        cfg["serve_model"] = serve_model
     if "openclaw" in agents:
         cfg["openclaw_secret"] = secrets.token_urlsafe(24)
-    save_config(cfg)
-    db.connect().close()  # init tables
-    _install_hooks(cfg)
+    resolved_cfg = _resolve_config(cfg)
+    save_config(resolved_cfg)
+    db.init()
+    hook_results = _install_hooks(cfg)
+    if "openclaw" in agents and not hook_results.get("openclaw", False):
+        resolved_cfg.pop("openclaw_secret", None)
+        save_config(resolved_cfg)
 
     # set up training schedule
     from reinforceclaw import scheduler
-    schedule = cfg.get("train_schedule", "03:00")
-    if schedule not in ("manual", "auto"):
-        if scheduler.install(schedule, cfg.get("schedule_window_minutes", 180)):
+    schedule = cfg.get("train_schedule", "auto")
+    if scheduler.install(schedule, cfg.get("schedule_window_minutes", 180)):
+        if schedule not in ("manual", "auto"):
             console.print(f"[green]Training scheduled daily at {schedule}[/green]")
-        else:
-            cfg["train_schedule"] = "manual"
-            save_config(cfg)
-            console.print("[yellow]Scheduler install failed. Training left in manual mode.[/yellow]")
+    else:
+        resolved_cfg["train_schedule"] = "manual"
+        save_config(resolved_cfg)
+        detail = f" {escape(scheduler.LAST_ERROR)}" if getattr(scheduler, "LAST_ERROR", "") else ""
+        console.print(f"[yellow]Scheduler install failed. Training left in manual mode.{detail}[/yellow]")
 
     console.print("\n")
     console.print(Panel(
@@ -253,7 +345,7 @@ def cmd_init(_args):
         f"Config: [dim]{CONFIG_PATH}[/dim]\n\n"
         f"1. Use your AI agent normally\n"
         f"2. Rate responses ([bold]/rl good[/bold], [bold]/rl bad[/bold], or ignore)\n"
-        f"3. Once you hit {cfg['batch_min']} ratings, training becomes eligible and runs at {cfg.get('train_schedule', '03:00')} by default (or [bold]reinforceclaw train[/bold] anytime)\n"
+        f"3. Once you hit {resolved_cfg['batch_min']} ratings, training runs automatically in the background\n"
         f"4. [bold]reinforceclaw status[/bold] to check progress | [bold]reinforceclaw history[/bold] to fix ratings",
         title="Setup complete", border_style="green"))
 
@@ -261,40 +353,49 @@ def cmd_init(_args):
 def _install_hooks(cfg):
     """Install hooks for each selected agent."""
     hook_dir = Path(__file__).parent / "hooks"
+    results = {}
 
     if "claude_code" in cfg.get("agents", []):
         _install_claude_code_hooks(hook_dir)
+        results["claude_code"] = True
     if "codex" in cfg.get("agents", []):
         _install_codex_hooks(hook_dir)
+        results["codex"] = True
     if "openclaw" in cfg.get("agents", []):
-        _install_openclaw_plugin(cfg)
+        results["openclaw"] = _install_openclaw_plugin(cfg)
+    return results
+
+
+def _is_reinforceclaw_hook(entry, script_name):
+    for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
+        command = hook.get("command", "") if isinstance(hook, dict) else ""
+        if "reinforceclaw" in command and script_name in command:
+            return True
+    return False
+
+
+def _replace_reinforceclaw_hook(existing, entry, script_name):
+    existing = existing if isinstance(existing, list) else []
+    kept = [item for item in existing if not _is_reinforceclaw_hook(item, script_name)]
+    kept.append(entry)
+    return kept
+
+
+def _install_json_hooks(path, script_name, command):
+    cfg = _read_json(path)
+    hooks = cfg.get("hooks") if isinstance(cfg.get("hooks"), dict) else {}
+    for event, arg in (("Stop", "stop"), ("UserPromptSubmit", "prompt")):
+        existing = hooks.get(event, [])
+        entry = {"hooks": [{"type": "command", "command": f"{command} {arg}", "timeout": 30}]}
+        hooks[event] = _replace_reinforceclaw_hook(existing, entry, script_name)
+    cfg["hooks"] = hooks
+    _write_json_atomic(path, cfg, backup=True)
 
 
 def _install_claude_code_hooks(hook_dir):
     settings_path = Path.home() / ".claude" / "settings.json"
-    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
-    hooks = settings.get("hooks", {})
     script = str(hook_dir / "claude_code.py")
-    python = shlex.quote(sys.executable)
-    command = f"{python} {shlex.quote(script)}"
-
-    # Stop hook — fires after each assistant turn
-    stop_hooks = hooks.get("Stop", [])
-    entry = {"type": "command", "command": f"{command} stop"}
-    if not any(script in str(h.get("command", "")) for h in stop_hooks):
-        stop_hooks.append(entry)
-
-    # UserPromptSubmit — intercepts /rl commands
-    prompt_hooks = hooks.get("UserPromptSubmit", [])
-    entry2 = {"type": "command", "command": f"{command} prompt"}
-    if not any(script in str(h.get("command", "")) for h in prompt_hooks):
-        prompt_hooks.append(entry2)
-
-    hooks["Stop"] = stop_hooks
-    hooks["UserPromptSubmit"] = prompt_hooks
-    settings["hooks"] = hooks
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    _install_json_hooks(settings_path, "claude_code.py", f"{shlex.quote(sys.executable)} {shlex.quote(script)}")
     console.print(f"[green]Claude Code hooks installed:[/green] {settings_path}")
 
 
@@ -302,37 +403,56 @@ def _install_codex_hooks(hook_dir):
     """Install hooks into Codex CLI's hooks.json."""
     # codex hooks live at ~/.codex/hooks.json — same protocol as claude code
     hooks_path = Path.home() / ".codex" / "hooks.json"
-    hooks_cfg = json.loads(hooks_path.read_text()) if hooks_path.exists() else {}
-    hooks = hooks_cfg.get("hooks", {})
     script = str(hook_dir / "codex.py")
-    python = shlex.quote(sys.executable)
-
-    stop_hooks = hooks.get("Stop", [])
-    entry = {"hooks": [{"type": "command", "command": f"{python} {shlex.quote(script)} stop", "timeout": 30}]}
-    if not any(script in json.dumps(h) for h in stop_hooks):
-        stop_hooks.append(entry)
-
-    prompt_hooks = hooks.get("UserPromptSubmit", [])
-    entry2 = {"hooks": [{"type": "command", "command": f"{python} {shlex.quote(script)} prompt", "timeout": 30}]}
-    if not any(script in json.dumps(h) for h in prompt_hooks):
-        prompt_hooks.append(entry2)
-
-    hooks["Stop"] = stop_hooks
-    hooks["UserPromptSubmit"] = prompt_hooks
-    hooks_cfg["hooks"] = hooks
-    hooks_path.parent.mkdir(parents=True, exist_ok=True)
-    hooks_path.write_text(json.dumps(hooks_cfg, indent=2) + "\n")
+    _install_json_hooks(hooks_path, "codex.py", f"{shlex.quote(sys.executable)} {shlex.quote(script)}")
+    _enable_codex_hooks_feature()
     console.print(f"[green]Codex hooks installed:[/green] {hooks_path}")
 
 
-def _install_openclaw_plugin(cfg):
-    """Auto-install the reinforceclaw plugin into openclaw. Detects platforms automatically."""
-    plugin_dir = Path(__file__).parent.parent / "openclaw-plugin"
-    if not plugin_dir.exists():
-        console.print("[yellow]openclaw-plugin/ not found. Skipping.[/yellow]")
+def _enable_codex_hooks_feature():
+    config_path = Path.home() / ".codex" / "config.toml"
+    text = config_path.read_text() if config_path.exists() else ""
+    db.secure_private_dir(config_path.parent)
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+    if tomllib:
+        try:
+            if tomllib.loads(text or "").get("features", {}).get("codex_hooks") is True:
+                return
+        except tomllib.TOMLDecodeError:
+            pass
+    lines = text.splitlines()
+    in_features = False
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_features:
+                lines.insert(idx, "codex_hooks = true")
+                _write_text_atomic(config_path, "\n".join(lines).rstrip() + "\n", backup=True)
+                return
+            in_features = stripped == "[features]"
+            continue
+        if in_features and stripped.startswith("codex_hooks"):
+            lines[idx] = "codex_hooks = true"
+            _write_text_atomic(config_path, "\n".join(lines).rstrip() + "\n", backup=True)
+            return
+    if in_features:
+        lines.append("codex_hooks = true")
+        _write_text_atomic(config_path, "\n".join(lines).rstrip() + "\n", backup=True)
         return
+    _write_text_atomic(config_path, text.rstrip() + ("\n\n" if text.strip() else "") + "[features]\ncodex_hooks = true\n", backup=True)
+
+
+def _install_openclaw_plugin(cfg):
+    """Install the OpenClaw plugin into the user's existing gateway."""
+    plugin_dir = Path(__file__).parent / "openclaw_plugin"
+    if not plugin_dir.exists():
+        console.print("[yellow]Bundled OpenClaw plugin not found. Skipping.[/yellow]")
+        return False
     secret = cfg.get("openclaw_secret")
-    # try to install — if openclaw isn't installed it'll just fail quietly
+    host = "http://127.0.0.1:8420"
     import subprocess
     try:
         result = subprocess.run(
@@ -340,19 +460,35 @@ def _install_openclaw_plugin(cfg):
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0:
-            console.print("[green]OpenClaw plugin installed — all platforms connected[/green]")
             if secret:
-                console.print(
-                    "[yellow]Set the OpenClaw plugin config field[/yellow] "
-                    "[bold]reinforceclawSecret[/bold] "
-                    f"[yellow]to:[/yellow] [dim]{secret}[/dim]"
-                )
+                _write_private_json(OPENCLAW_BRIDGE_CONFIG, {"host": host, "secret": secret, "python": sys.executable})
+            configured = True
+            for path, value in (
+                ("plugins.entries.reinforceclaw-feedback.config.reinforceclawHost", host),
+                ("plugins.entries.reinforceclaw-feedback.config.reinforceclawPython", sys.executable),
+            ):
+                if not value:
+                    continue
+                configured = subprocess.run(
+                    ["openclaw", "config", "set", path, value],
+                    capture_output=True, text=True, timeout=15,
+                ).returncode == 0 and configured
+            enabled = subprocess.run(["openclaw", "plugins", "enable", "reinforceclaw-feedback"], capture_output=True, text=True, timeout=15).returncode == 0
+            if configured and enabled:
+                console.print("[green]OpenClaw plugin installed — use /rl good, /rl bad, /rl undo, or /rl status in any connected channel[/green]")
+                return True
+            console.print("[yellow]OpenClaw plugin installed but could not be fully enabled/configured. Run reinforceclaw init again after checking OpenClaw.[/yellow]")
+            OPENCLAW_BRIDGE_CONFIG.unlink(missing_ok=True)
+            return False
         else:
             console.print(f"[yellow]OpenClaw plugin install failed: {result.stderr.strip()}[/yellow]")
+        return False
     except FileNotFoundError:
         console.print("[yellow]openclaw not found. Install it first, then run reinforceclaw init again.[/yellow]")
+        return False
     except subprocess.TimeoutExpired:
         console.print("[yellow]OpenClaw plugin install timed out.[/yellow]")
+        return False
 
 
 # -- rating commands --
@@ -363,13 +499,19 @@ def cmd_rate(_args, rating=None):
     if not cfg:
         return
     conn = db.connect()
-    pending = db.latest_pending(conn)  # find any unrated response, regardless of source
-    if pending:
-        db.update_feedback_rating(conn, pending["id"], rating)
-    else:
-        # external CLI doesn't have the actual conversation — store what we have
-        # the hook path stores real prompt/response text, this is the fallback
-        db.add_feedback(conn, cfg["model"], "(cli)", "(cli)", rating, source="cli")
+    pending = pop_pending("claude_code") or pop_pending("codex")
+    if not pending:
+        console.print(
+            "[yellow]No captured response to rate. Use /rl good or /rl bad in your agent, "
+            "or keep the panel on.[/yellow]"
+        )
+        conn.close()
+        return
+    db.add_feedback(
+        conn, pending["model"], pending["prompt"], pending["response"], rating,
+        context=pending.get("context"), source=pending.get("source", "cli"),
+        event_id=pending.get("key"), rollout_context=pending.get("rollout_context"),
+    )
     label = "[green]good[/green]" if rating == 1 else "[red]bad[/red]"
     console.print(f"Rated: {label}")
     _maybe_train(cfg, conn)
@@ -393,68 +535,56 @@ def cmd_train(_args):
         return
     background = bool(getattr(_args, "background", False))
     cfg = {**cfg, "_background": background}
-    compat = trainer.model_compatibility(cfg)
-    if not compat["ok"]:
-        console.print(f"[red]Model/backend incompatibility:[/red] {compat['reason']}")
-        if compat.get("detail"):
-            console.print(f"[dim]{compat['detail']}[/dim]")
-        return
     conn = db.connect()
     n = _trainable_untrained(conn)
     batch_min = cfg.get("batch_min", 8)
-    if n < batch_min:
+    resume = trainer._resume_state(conn, cfg)
+    if background:
+        TRAIN_RETRY_PATH.unlink(missing_ok=True)
+    if n < batch_min and not resume:
         console.print(f"[yellow]Only {n} rated responses. Need at least {batch_min}.[/yellow]")
         conn.close()
         return
     # only ask for confirmation when human is at the keyboard
     if sys.stdin.isatty() and not background:
-        msg = (f"[yellow]{n} ratings — might be weak with so few. Train anyway?[/yellow]"
-               if n < batch_min * 2 else f"{n} ratings ready. Train now?")
-        if not Confirm.ask(msg):
+        if not Confirm.ask(f"{n} ratings ready. Train now?"):
             conn.close()
             return
     console.print("[bold]Training...[/bold]" if not background else "[dim]Background training...[/dim]")
     result = trainer.train_result(cfg, conn)
     if result.get("status") == "trained":
         metrics = {k: v for k, v in result.items() if k != "status"}
-        gate_ready = all(key in metrics for key in ("path", "version", "ema_mean", "ema_count", "feedback_ids"))
-        gate = {"ok": True, "reason": "legacy_train_result"} if not gate_ready else trainer.publish_gate(cfg, metrics["path"])
+        gate = trainer.publish_gate(cfg, metrics["path"])
         if gate.get("ok"):
-            if gate_ready:
-                db.activate_training_round(conn, metrics["version"], metrics["ema_mean"], metrics["ema_count"], metrics["feedback_ids"])
+            db.activate_training_round(conn, metrics["version"], metrics["ema_mean"], metrics["ema_count"], metrics["feedback_ids"])
             console.print(f"[green]Done![/green] Loss: {metrics['avg_loss']:.4f}, "
                            f"Batch: {metrics['batch_size']}, EMA: {metrics['ema_mean']:.3f}")
             if background:
                 _record_background_event(conn, "success")
             ok = _swap_latest(cfg, conn)
             if ok is True:
-                console.print("[green]Adapter loaded.[/green]")
+                console.print("[green]Prepared adapter/model loaded.[/green]")
             elif ok is False:
-                console.print("[yellow]Hot-swap failed. Restart server manually.[/yellow]")
+                console.print("[yellow]Could not load adapter automatically. Restart or repoint your server manually.[/yellow]")
             elif ok is None:
                 console.print("[yellow]Adapter saved. Manual server reload may still be needed.[/yellow]")
         else:
-            if gate_ready:
-                db.reject_adapter(conn, metrics["version"])
+            db.reject_adapter(conn, metrics["version"])
             console.print("[yellow]Trained candidate rejected by publish gate.[/yellow]")
             if gate.get("reason"):
                 console.print(f"[dim]Gate: {gate['reason']}[/dim]")
-            if gate.get("base_score") is not None:
-                console.print(f"[dim]Canary: {gate['candidate_score']}/{len(trainer._PUBLISH_CANARY)} vs base {gate['base_score']}/{len(trainer._PUBLISH_CANARY)}[/dim]")
     else:
         reason = result.get("reason", "unknown")
-        if background and reason in {
-            "resume_pending", "high_cpu_load", "memory_busy", "gpu_busy", "gpu_memory_busy",
-            "host_memory_busy", "low_free_vram", "outside_schedule_window",
-            "missing_cuda_idle_telemetry", "memory_pressure", "insufficient_headroom",
-        }:
-            _record_background_event(conn, "pressure")
-        if background and reason in {
-            "resume_pending",
+        transient = {
             "high_cpu_load", "memory_busy", "gpu_busy", "gpu_memory_busy",
             "host_memory_busy", "low_free_vram", "outside_schedule_window",
             "missing_cuda_idle_telemetry", "memory_pressure", "insufficient_headroom",
-        }:
+        }
+        if background and reason == "resume_pending":
+            from reinforceclaw.hooks._common import queue_training
+            queue_training(delay_seconds=1)
+        elif background and reason in transient:
+            _record_background_event(conn, "pressure")
             from reinforceclaw.hooks._common import queue_training
             queue_training(delay_seconds=_next_retry_delay(conn))
         console.print(
@@ -500,6 +630,13 @@ def cmd_status(_args):
     t.add_column("")
     t.add_row("Model", cfg.get("model", "not set"))
     t.add_row("Preset", cfg.get("preset", "balanced"))
+    from .profile import detect as _detect_profile
+    mp = cfg.get("model_profile")
+    if not mp:
+        _p = _detect_profile(cfg.get("model", ""))
+        mp = {"kind": _p.kind, "size_bucket": _p.size_bucket}
+    t.add_row("Profile", f"{mp.get('kind', '?')} / {mp.get('size_bucket', mp.get('scale', '?'))}")
+    t.add_row("Tuning", cfg.get("tuning_mode", "auto"))
     t.add_row("Server", cfg.get("server", "ollama"))
     t.add_row("Adapter", f"v{latest['version']}" if latest else "none (base model)")
     t.add_row("Ratings", f"{counts['total']} total ({counts['good']}+ {counts['bad']}-)")
@@ -527,18 +664,22 @@ def cmd_rollback(_args):
         t.add_row(f"v{a['version']}", status, a["created_at"])
     console.print(t)
     pick = IntPrompt.ask("Roll back to version", default=adapters[0]["version"])
-    prev = db.rollback_to(conn, pick)
+    prev, error = rollback_adapter(conn, cfg, pick)
     if prev:
         console.print(f"[green]Now on v{prev['version']}[/green]")
-        trainer.hot_swap(cfg.get("server", "ollama"), prev["path"], cfg.get("model", ""))
+    elif error:
+        console.print(f"[yellow]{error}[/yellow]")
     conn.close()
 
 
 def cmd_reset(_args):
     if not Confirm.ask("[red]Delete all ratings, adapters, and start fresh?[/red]"):
         return
-    reset_state()
-    console.print("[green]Reset. Clean slate.[/green]")
+    try:
+        reset_state()
+        console.print("[green]Reset. Clean slate.[/green]")
+    except RuntimeError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
 
 
 def cmd_on(_a):
@@ -549,7 +690,7 @@ def cmd_off(_a):
 
 
 def _maybe_train(cfg, conn):
-    if cfg.get("train_schedule", "03:00") != "auto":
+    if cfg.get("train_schedule", "auto") != "auto":
         return
     if _trainable_untrained(conn) >= cfg.get("batch_min", 8):
         from reinforceclaw.hooks._common import queue_training
@@ -558,7 +699,7 @@ def _maybe_train(cfg, conn):
 
 
 def cmd_history(_args):
-    """Show recent ratings. Use 'reinforceclaw rate <id> good/bad' to change one."""
+    """Show recent ratings. Use 'reinforceclaw rate <id> good|bad|delete' to edit one."""
     conn = db.connect()
     rows = db.recent(conn)
     if not rows:
@@ -573,22 +714,24 @@ def cmd_history(_args):
     t.add_column("When")
     for r in rows:
         label = {"1": "[green]good[/green]", "-1": "[red]bad[/red]", "0": "[dim]unrated[/dim]"}
-        t.add_row(str(r["id"]), r["prompt"][:50], label.get(str(r["rating"]), "?"),
+        prompt = r["prompt"][:47] + "..." if len(r["prompt"]) > 50 else r["prompt"]
+        t.add_row(str(r["id"]), prompt, label.get(str(r["rating"]), "?"),
                   r["source"], r["created_at"])
     console.print(t)
-    console.print("[dim]To change a rating: reinforceclaw rate <id> <good|bad>[/dim]")
+    console.print("[dim]To change a rating: reinforceclaw rate <id> <good|bad|delete>[/dim]")
     conn.close()
 
 
 def cmd_rerate(_args):
-    """Change a specific rating: reinforceclaw rate 42 good"""
-    if not hasattr(_args, 'id') or not hasattr(_args, 'value'):
-        console.print("Usage: reinforceclaw rate <id> <good|bad>")
-        return
-    rating = 1 if _args.value == "good" else -1
+    """Change or delete a specific rating: reinforceclaw rate 42 good|bad|delete"""
+    rating = {"good": 1, "bad": -1, "delete": 0, "ignore": 0}[_args.value]
     conn = db.connect()
-    db.update_feedback_rating(conn, int(_args.id), rating)
-    console.print(f"Rating #{_args.id} changed to {'[green]good[/green]' if rating == 1 else '[red]bad[/red]'}")
+    changed = db.revise_feedback_rating(conn, _args.id, rating)
+    if changed:
+        label = "[green]good[/green]" if rating == 1 else "[red]bad[/red]" if rating == -1 else "[dim]deleted[/dim]"
+        console.print(f"Rating #{_args.id} changed to {label}")
+    else:
+        console.print(f"[yellow]No rating found with ID {_args.id}.[/yellow]")
     conn.close()
 
 
@@ -609,182 +752,11 @@ def cmd_schedule(_args):
             save_config(cfg)
             console.print(f"[green]Schedule set: {val}[/green]")
         else:
-            console.print("[red]Could not install scheduler. Leaving existing schedule unchanged.[/red]")
+            detail = f" {escape(scheduler.LAST_ERROR)}" if getattr(scheduler, "LAST_ERROR", "") else ""
+            console.print(f"[red]Could not install scheduler. Leaving existing schedule unchanged.{detail}[/red]")
     else:
-        console.print(f"Current: {cfg.get('train_schedule', '03:00')}")
+        console.print(f"Current: {cfg.get('train_schedule', 'auto')}")
         console.print("[dim]reinforceclaw schedule 03:00 / auto / manual[/dim]")
-
-
-def cmd_promptgen(_args):
-    topics = collect.normalize_topics(getattr(_args, "topics", None))
-    count = max(1, int(getattr(_args, "count", 40)))
-    server = getattr(_args, "server", "openai")
-    base_url = getattr(_args, "base_url", "") or _server_base_url(server, {}, prefix="prompt")
-    model = getattr(_args, "model", None)
-    if not model:
-        console.print("[red]Provide --model for prompt generation.[/red]")
-        return
-    if not base_url:
-        console.print("[red]Provide --base-url for the prompt generator.[/red]")
-        return
-    console.print(f"[bold]Generating {count} prompts with {model}...[/bold]")
-    prompts = collect.helper_generate_prompts(
-        model=model,
-        count=count,
-        topics=topics,
-        server=server,
-        base_url=base_url,
-        api_key=_api_key(getattr(_args, "api_key", None), "prompt"),
-    )
-    output = getattr(_args, "output", "") or str(Path.home() / ".reinforceclaw" / "prompts.jsonl")
-    Path(output).parent.mkdir(parents=True, exist_ok=True)
-    collect.save_prompts(output, prompts)
-    console.print(f"[green]Saved {len(prompts)} prompts:[/green] {output}")
-
-
-def cmd_collect(_args):
-    cfg = _load_model_cfg()
-    if not cfg:
-        return
-    conn = db.connect()
-    latest = db.latest_adapter(conn)
-    topics = collect.normalize_topics(getattr(_args, "topics", None))
-    count = max(1, int(getattr(_args, "count", 40)))
-    if getattr(_args, "file", None):
-        prompts = collect.load_prompts(_args.file)
-    elif getattr(_args, "prompt_model", None):
-        prompt_server = getattr(_args, "prompt_server", "openai")
-        prompt_base_url = getattr(_args, "prompt_base_url", "") or _server_base_url(prompt_server, cfg, prefix="prompt")
-        if not prompt_base_url:
-            console.print("[red]Provide --prompt-base-url for helper prompt generation.[/red]")
-            conn.close()
-            return
-        console.print(f"[bold]Generating {count} prompts with {getattr(_args, 'prompt_model')}...[/bold]")
-        prompts = collect.helper_generate_prompts(
-            model=_args.prompt_model,
-            count=count,
-            topics=topics,
-            server=prompt_server,
-            base_url=prompt_base_url,
-            api_key=_api_key(getattr(_args, "prompt_api_key", None), "prompt"),
-        )
-    else:
-        prompts = collect.sample_prompts(count, topics)
-
-    server = cfg.get("server", "ollama")
-    base_url = _server_base_url(server, cfg)
-    use_local_mlx = server == "ollama" and (not base_url or not collect.ollama_available(base_url))
-    if server != "ollama" and server != "mlx" and not base_url:
-        console.print("[red]Set server_base_url in config or use --file with an existing chat workflow.[/red]")
-        conn.close()
-        return
-    if use_local_mlx:
-        console.print("[dim]Ollama is not reachable. Using local MLX inference for collection.[/dim]")
-        server = "mlx"
-    turns = max(1, int(getattr(_args, "turns", 1)))
-    if turns > 1 and not getattr(_args, "prompt_model", None):
-        console.print("[yellow]Multi-turn needs --prompt-model for follow-up user turns. Falling back to 1 turn.[/yellow]")
-        turns = 1
-    judge_model = getattr(_args, "judge_model", None)
-    judge_server = getattr(_args, "judge_server", "openai")
-    judge_base_url = getattr(_args, "judge_base_url", "") or _server_base_url(judge_server, cfg, prefix="judge")
-    judge_api_key = _api_key(getattr(_args, "judge_api_key", None), "judge")
-    if judge_model and judge_server != "mlx" and not judge_base_url:
-        console.print("[red]Provide --judge-base-url for the judge model.[/red]")
-        conn.close()
-        return
-    target_model = _ollama_target_model(cfg["model"], latest) if cfg.get("server", "ollama") == "ollama" else cfg["model"]
-    target_adapter = latest["path"] if latest and server == "mlx" else None
-
-    good = bad = ignored = 0
-    for i, item in enumerate(prompts, 1):
-        seed_prompt = item["prompt"].strip()
-        console.print(Panel(seed_prompt, title=f"Prompt {i}/{len(prompts)} [{item['topic']}]", border_style="cyan"))
-        messages = [{"role": "user", "content": seed_prompt}]
-        try:
-            for turn in range(turns):
-                response = collect.chat(
-                    server=server,
-                    model=target_model,
-                    messages=messages,
-                    base_url=base_url,
-                    api_key=_api_key(cfg.get("server_api_key"), "server"),
-                    timeout=180,
-                    adapter_path=target_adapter,
-                    lora_rank=cfg.get("lora_rank", 8),
-                )
-                messages.append({"role": "assistant", "content": response})
-                if turn + 1 >= turns:
-                    break
-                followup = collect.continue_conversation(
-                    model=_args.prompt_model,
-                    transcript=messages,
-                    server=prompt_server,
-                    base_url=prompt_base_url,
-                    api_key=_api_key(getattr(_args, "prompt_api_key", None), "prompt"),
-                )
-                messages.append({"role": "user", "content": followup})
-        except Exception as exc:
-            console.print(f"[red]Inference failed:[/red] {exc}")
-            break
-        train_prompt, train_response = collect.flatten_transcript(messages)
-        console.print(Panel(train_response, title="Model Response", border_style="green"))
-
-        if judge_model:
-            try:
-                decision = collect.judge_response(
-                    model=judge_model,
-                    prompt=train_prompt,
-                    response=train_response,
-                    server=judge_server,
-                    base_url=judge_base_url,
-                    api_key=judge_api_key,
-                    transcript=messages,
-                )
-            except Exception as exc:
-                console.print(f"[yellow]Judge failed, ignored sample:[/yellow] {exc}")
-                ignored += 1
-                continue
-            console.print(f"[bold]Judge:[/bold] {decision}")
-            action = {"good": "g", "bad": "b", "ignore": "i"}[decision]
-        else:
-            action = Prompt.ask("Rate", choices=["g", "b", "i", "q"], default="i")
-
-        if action == "q":
-            break
-        if action == "i":
-            ignored += 1
-            continue
-        rating = 1 if action == "g" else -1
-        db.add_feedback(
-            conn,
-            cfg["model"],
-            train_prompt,
-            train_response,
-            rating,
-            context=json.dumps({
-                "topic": item["topic"],
-                "messages": messages[:-1],
-                "transcript": messages,
-                "served_model": target_model,
-                "adapter_version": latest["version"] if latest else None,
-            }),
-            source="collect",
-        )
-        if rating == 1:
-            good += 1
-        else:
-            bad += 1
-
-    console.print(f"[green]Collected[/green] {good}+ {bad}- | [dim]{ignored} ignored[/dim]")
-    if server == "mlx":
-        collect._clear_local_mlx()
-    _maybe_train(cfg, conn)
-    conn.close()
-
-
-def cmd_loop(_args):
-    cmd_collect(_args)
 
 
 COMMANDS = {
@@ -792,7 +764,6 @@ COMMANDS = {
     "undo": cmd_undo, "train": cmd_train, "status": cmd_status,
     "rollback": cmd_rollback, "reset": cmd_reset, "on": cmd_on, "off": cmd_off,
     "history": cmd_history, "schedule": cmd_schedule, "smoke": cmd_smoke,
-    "promptgen": cmd_promptgen, "collect": cmd_collect, "loop": cmd_loop,
 }
 
 
@@ -800,67 +771,33 @@ def main():
     parser = argparse.ArgumentParser(prog="reinforceclaw", description="Personal RL for AI agents")
     sub = parser.add_subparsers(dest="command")
     for name in COMMANDS:
-        if name in ("rate", "schedule", "train", "promptgen", "collect", "loop"):
+        if name in ("rate", "schedule", "train"):
             continue  # these have custom args, added below
         sub.add_parser(name)
 
     train_p = sub.add_parser("train", help="Run training now")
     train_p.add_argument("--background", action="store_true")
 
-    # reinforceclaw rate <id> <good|bad>
-    rate_p = sub.add_parser("rate", help="Change a rating: reinforceclaw rate 42 good")
-    rate_p.add_argument("id")
-    rate_p.add_argument("value", choices=["good", "bad"])
+    # reinforceclaw rate <id> <good|bad|delete>
+    rate_p = sub.add_parser("rate", help="Change/delete a rating: reinforceclaw rate 42 good|bad|delete")
+    rate_p.add_argument("id", type=int)
+    rate_p.add_argument("value", choices=["good", "bad", "delete", "ignore"])
 
     # reinforceclaw schedule <time>
     sched_p = sub.add_parser("schedule", help="Set training schedule")
     sched_p.add_argument("time", nargs="?")
 
-    promptgen_p = sub.add_parser("promptgen", help="Generate prompts with a fast helper model")
-    promptgen_p.add_argument("--model")
-    promptgen_p.add_argument("--server", default="openai")
-    promptgen_p.add_argument("--base-url")
-    promptgen_p.add_argument("--api-key")
-    promptgen_p.add_argument("--topics", default="code,math,instructions,personality")
-    promptgen_p.add_argument("--count", type=int, default=40)
-    promptgen_p.add_argument("--output")
-
-    collect_p = sub.add_parser("collect", help="Run real inference and rate good/bad/ignore")
-    collect_p.add_argument("--file")
-    collect_p.add_argument("--prompt-model")
-    collect_p.add_argument("--prompt-server", default="openai")
-    collect_p.add_argument("--prompt-base-url")
-    collect_p.add_argument("--prompt-api-key")
-    collect_p.add_argument("--judge-model")
-    collect_p.add_argument("--judge-server", default="openai")
-    collect_p.add_argument("--judge-base-url")
-    collect_p.add_argument("--judge-api-key")
-    collect_p.add_argument("--topics", default="code,math,instructions,personality")
-    collect_p.add_argument("--count", type=int, default=40)
-    collect_p.add_argument("--turns", type=int, default=1)
-
-    loop_p = sub.add_parser("loop", help="Alias for collect")
-    loop_p.add_argument("--file")
-    loop_p.add_argument("--prompt-model")
-    loop_p.add_argument("--prompt-server", default="openai")
-    loop_p.add_argument("--prompt-base-url")
-    loop_p.add_argument("--prompt-api-key")
-    loop_p.add_argument("--judge-model")
-    loop_p.add_argument("--judge-server", default="openai")
-    loop_p.add_argument("--judge-base-url")
-    loop_p.add_argument("--judge-api-key")
-    loop_p.add_argument("--topics", default="code,math,instructions,personality")
-    loop_p.add_argument("--count", type=int, default=40)
-    loop_p.add_argument("--turns", type=int, default=1)
-
     args = parser.parse_args()
     if args.command == "rate":
         cmd_rerate(args)
+        return 0
     elif args.command in COMMANDS:
         COMMANDS[args.command](args)
+        return 0
     else:
         parser.print_help()
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,7 +1,6 @@
 """Training scheduler. Uses launchd on mac, systemd on linux."""
-# default: train at 3am if batch is ready
-# if machine was off at 3am, trains on next wake/boot
-# configurable: "03:00", "manual", "auto" (immediate when batch ready)
+# default: "auto" queues background training when a batch is ready.
+# scheduled times like "03:00" are optional for users who prefer a clock window.
 
 import platform
 import subprocess
@@ -9,12 +8,15 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import db
+
 PLIST_PATH = Path.home() / "Library/LaunchAgents/com.reinforceclaw.train.plist"
 SYSTEMD_PATH = Path.home() / ".config/systemd/user/reinforceclaw-train.timer"
 SYSTEMD_SERVICE = Path.home() / ".config/systemd/user/reinforceclaw-train.service"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TRAIN_LOG = Path.home() / ".reinforceclaw" / "train.log"
 DEFAULT_WINDOW_MINUTES = 180
+LAST_ERROR = ""
 
 
 def _attempt_times(schedule="03:00", window_minutes: int = DEFAULT_WINDOW_MINUTES):
@@ -26,12 +28,11 @@ def _attempt_times(schedule="03:00", window_minutes: int = DEFAULT_WINDOW_MINUTE
 
 def install(schedule="03:00", window_minutes: int = DEFAULT_WINDOW_MINUTES):
     """Install system scheduler. Returns True on success."""
+    db.secure_private_dir(TRAIN_LOG.parent)
     if schedule == "manual":
-        uninstall()
-        return True
+        return uninstall()
     if schedule == "auto":
-        uninstall()  # no system scheduler needed, hooks handle it
-        return True
+        return uninstall()  # no system scheduler needed, hooks handle it
 
     attempt_times = _attempt_times(schedule, window_minutes)
     if platform.system() == "Darwin":
@@ -42,15 +43,52 @@ def install(schedule="03:00", window_minutes: int = DEFAULT_WINDOW_MINUTES):
 
 def uninstall():
     """Remove system scheduler."""
+    ok = True
     if PLIST_PATH.exists():
-        subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
+        ok = _run_ok(["launchctl", "unload", str(PLIST_PATH)]) and ok
         PLIST_PATH.unlink()
     if SYSTEMD_PATH.exists():
-        subprocess.run(["systemctl", "--user", "disable", "--now", "reinforceclaw-train.timer"], capture_output=True)
-        subprocess.run(["systemctl", "--user", "stop", "reinforceclaw-train.service"], capture_output=True)
+        ok = _run_ok(["systemctl", "--user", "disable", "--now", "reinforceclaw-train.timer"]) and ok
+        ok = _run_ok(["systemctl", "--user", "stop", "reinforceclaw-train.service"]) and ok
         SYSTEMD_PATH.unlink()
         SYSTEMD_SERVICE.unlink(missing_ok=True)
-        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        ok = _run_ok(["systemctl", "--user", "daemon-reload"]) and ok
+    return ok
+
+
+def _run_ok(cmd):
+    global LAST_ERROR
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        LAST_ERROR = (result.stderr or result.stdout or f"{cmd[0]} exited {result.returncode}").strip()
+        return False
+    except OSError as exc:
+        LAST_ERROR = str(exc)
+        return False
+
+
+def _write_text(path, text):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def _snapshot(*paths):
+    return {path: path.read_text() if path.exists() else None for path in paths}
+
+
+def _restore(snapshot):
+    for path, text in snapshot.items():
+        if text is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_text(path, text)
+
+
+def _systemd_arg(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _parse_time(s):
@@ -104,23 +142,32 @@ def _install_launchd(attempt_times):
     <string>{TRAIN_LOG}</string>
 </dict>
 </plist>"""
-    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
-    PLIST_PATH.write_text(plist)
-    r = subprocess.run(["launchctl", "load", str(PLIST_PATH)], capture_output=True)
-    return r.returncode == 0
+    db.secure_private_dir(PLIST_PATH.parent)
+    before = _snapshot(PLIST_PATH)
+    if PLIST_PATH.exists() and not _run_ok(["launchctl", "unload", str(PLIST_PATH)]):
+        return False
+    _write_text(PLIST_PATH, plist)
+    if _run_ok(["launchctl", "load", str(PLIST_PATH)]):
+        return True
+    _restore(before)
+    if before[PLIST_PATH] is not None:
+        _run_ok(["launchctl", "load", str(PLIST_PATH)])
+    return False
 
 
 def _install_systemd(attempt_times):
-    SYSTEMD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db.secure_private_dir(SYSTEMD_PATH.parent)
+    before = _snapshot(SYSTEMD_SERVICE, SYSTEMD_PATH)
+    if SYSTEMD_PATH.exists() and not _run_ok(["systemctl", "--user", "disable", "--now", "reinforceclaw-train.timer"]):
+        return False
     # service
-    SYSTEMD_SERVICE.write_text(f"""[Unit]
+    _write_text(SYSTEMD_SERVICE, f"""[Unit]
 Description=ReinforceClaw RL training
 
 [Service]
-ExecStart={sys.executable} -m reinforceclaw.cli train --background
-WorkingDirectory={PROJECT_ROOT}
-Environment=PYTHONPATH={PROJECT_ROOT}
+ExecStart={_systemd_arg(sys.executable)} -m reinforceclaw.cli train --background
+WorkingDirectory={_systemd_arg(PROJECT_ROOT)}
+Environment="PYTHONPATH={PROJECT_ROOT}"
 StandardOutput=append:{TRAIN_LOG}
 StandardError=append:{TRAIN_LOG}
 """)
@@ -128,17 +175,21 @@ StandardError=append:{TRAIN_LOG}
         f"OnCalendar=*-*-* {hour:02d}:{minute:02d}:00"
         for hour, minute in attempt_times
     )
-    SYSTEMD_PATH.write_text(f"""[Unit]
+    _write_text(SYSTEMD_PATH, f"""[Unit]
 Description=ReinforceClaw daily training
 
 [Timer]
 {calendar}
-Persistent=false
+Persistent=true
 
 [Install]
 WantedBy=timers.target
 """)
-    subprocess.run(["systemctl", "--user", "disable", "--now", "reinforceclaw-train.timer"], capture_output=True)
-    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-    r = subprocess.run(["systemctl", "--user", "enable", "--now", "reinforceclaw-train.timer"], capture_output=True)
-    return r.returncode == 0
+    ok = _run_ok(["systemctl", "--user", "daemon-reload"]) and _run_ok(["systemctl", "--user", "enable", "--now", "reinforceclaw-train.timer"])
+    if ok:
+        return True
+    _restore(before)
+    _run_ok(["systemctl", "--user", "daemon-reload"])
+    if before[SYSTEMD_PATH] is not None:
+        _run_ok(["systemctl", "--user", "enable", "--now", "reinforceclaw-train.timer"])
+    return False

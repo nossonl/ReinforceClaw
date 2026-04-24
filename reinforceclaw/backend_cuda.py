@@ -53,19 +53,23 @@ class CUDABackend:
         self.device = torch.device("cuda")
 
     def hardware(self) -> CUDAHardware:
-        props = self.torch.cuda.get_device_properties(self.device)
+        props = self.device_info()
         try:
             free_mem, _ = self.torch.cuda.mem_get_info(self.device)
             free_mem = int(free_mem)
         except Exception:
             free_mem = None
         return CUDAHardware(
-            device_name=props.name,
-            total_memory_bytes=int(props.total_memory),
+            device_name=props.get("name", "cuda"),
+            total_memory_bytes=int(props.get("total_memory", 0)),
             available_memory_bytes=free_mem,
             system_total_memory_bytes=_system_total_bytes(),
             system_available_memory_bytes=_available_bytes(),
         )
+
+    def device_info(self) -> dict:
+        props = self.torch.cuda.get_device_properties(self.device)
+        return {"name": props.name, "total_memory": props.total_memory}
 
     def apply_limits(self, limit_bytes: int, cache_fraction: float = 0.25) -> None:
         total = max(1, self.hardware().total_memory_bytes)
@@ -101,8 +105,10 @@ class CUDABackend:
             pass
 
     def clear_all(self) -> None:
+        self.synchronize()
         gc.collect()
         self.clear_cache()
+        self.synchronize()
 
     def synchronize(self) -> None:
         try:
