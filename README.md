@@ -6,15 +6,7 @@ Self-improving reinforcement learning for your AI agents. Set it up once, rate r
 
 ## Setup
 
-Current source checkout:
-
-```bash
-cd ReinforceClaw
-python3 -m pip install -e .
-reinforceclaw init
-```
-
-Published release, after the PyPI package is live:
+Install ReinforceClaw:
 
 ```bash
 python3 -m pip install --no-cache-dir reinforceclaw
@@ -22,6 +14,23 @@ reinforceclaw init
 ```
 
 Install the small base package first, then let the wizard add the right ML training backend for your machine. That keeps setup quiet while still supporting MLX on Apple Silicon and CUDA on Linux. If you already know what you want, you can install everything up front with `python3 -m pip install "reinforceclaw[mlx]"` on Apple Silicon or `python3 -m pip install "reinforceclaw[cuda]"` on Linux with CUDA.
+
+If you are adding only the OpenClaw plugin from npm:
+
+```bash
+npm install reinforceclaw
+```
+
+The npm package is the OpenClaw plugin bridge. The PyPI package is the full local RL system and setup wizard.
+
+Source checkout:
+
+```bash
+git clone https://github.com/nossonl/ReinforceClaw.git
+cd ReinforceClaw
+python3 -m pip install -e .
+reinforceclaw init
+```
 
 You can run the wizard yourself or tell your coding agent: "Set up ReinforceClaw for me." Pick your agent, local trainable model, and training preset. After that, just use your agent.
 
