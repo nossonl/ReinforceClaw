@@ -21,7 +21,7 @@ npm install reinforceclaw
 
 Use `pip install reinforceclaw` for the full local RL system and setup wizard. Use `npm install reinforceclaw` for JavaScript/OpenClaw installs.
 
-The wizard adds the right ML training backend for your machine, including MLX on Apple Silicon and CUDA on Linux. If you already know what you want, you can install everything up front with `pip install "reinforceclaw[mlx]"` on Apple Silicon or `pip install "reinforceclaw[cuda]"` on Linux with CUDA.
+The wizard adds the right ML training backend for your machine, including MLX on Apple Silicon and CUDA on Linux.
 
 You can run the wizard yourself or tell your coding agent: "Set up ReinforceClaw for me." Pick your agent, local trainable model, and training preset. After that, just use your agent.
 
