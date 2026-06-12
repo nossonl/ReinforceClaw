@@ -139,6 +139,8 @@ Positive advantage makes good responses more likely. Negative advantage makes ba
  
 Presets are based on the configs that worked best in our sweeps around 31B models, with separate paths for dense and MoE behavior. RL LoRA learning rates stay close to flat across sizes, so ReinforceClaw does not copy pre-training scaling rules. Pick `custom` in the wizard if you want to change anything.
 
+> **Note:** in `auto` tuning mode, preset values (learning rate, batch sizes, steps) are re-derived from your model's profile every time the config loads — hand-edits to those keys in `config.json` are ignored. Set `"tuning_mode": "custom"` to pin your own values.
+
 Dense and MoE models use different config paths:
 
 | Model type | What ReinforceClaw keys on | Default behavior |
@@ -180,7 +182,8 @@ openclaw plugins inspect reinforceclaw-feedback
 ## Requirements
  
 - Python 3.10+
-- Apple Silicon with MLX or Linux with CUDA
+- Apple Silicon with MLX or Linux with CUDA (Intel Macs can't train: MLX needs Apple Silicon)
+- For OpenClaw: Node.js 20+ (OpenClaw's own installer fails on Node 18)
 - A local trainable model
 - Recommended for live use: a local inference server such as Ollama, LM Studio, or vLLM. After training, point your agent at the prepared local model/adapter output.
 
