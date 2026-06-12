@@ -501,9 +501,16 @@ function trimTrackedMaps() {
   ] as Map<string, any>[]) trimMap(map);
 }
 
+const BRIDGE_READY_CACHE_MS = 30_000;
+let bridgeReadyUntil = 0;
+
 async function bridgeReady(host: string) {
+  // cache success so each rating costs one bridge request, not a ping + the
+  // real call; failures are never cached so recovery is immediate
+  if (Date.now() < bridgeReadyUntil) return true;
   try {
     const r = await fetchWithTimeout(`${host}/feedback/status`, { headers: secretHeader() });
+    if (r.ok) bridgeReadyUntil = Date.now() + BRIDGE_READY_CACHE_MS;
     return r.ok;
   } catch {
     return false;

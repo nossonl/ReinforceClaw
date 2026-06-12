@@ -471,9 +471,13 @@ function trimTrackedMaps() {
     promptedPendingKeys
   ]) trimMap(map);
 }
+const BRIDGE_READY_CACHE_MS = 3e4;
+let bridgeReadyUntil = 0;
 async function bridgeReady(host) {
+  if (Date.now() < bridgeReadyUntil) return true;
   try {
     const r = await fetchWithTimeout(`${host}/feedback/status`, { headers: secretHeader() });
+    if (r.ok) bridgeReadyUntil = Date.now() + BRIDGE_READY_CACHE_MS;
     return r.ok;
   } catch {
     return false;
