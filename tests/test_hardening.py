@@ -1167,3 +1167,18 @@ def test_forward_kwargs_only_pass_logits_to_keep_when_named():
     assert named.get("logits_to_keep") == 2
     loose = trainer._torch_forward_kwargs(KwargsOnly(), item, torch, logits_to_keep=2)
     assert "logits_to_keep" not in loose and "num_logits_to_keep" not in loose
+
+
+def test_untrained_selection_follows_arrival_order_within_same_second(tmp_path):
+    import random
+
+    conn = db.connect(tmp_path / "t.db")
+    rng = random.Random(1)
+    items = [(i, 1 if i % 2 else -1) for i in range(20)]
+    rng.shuffle(items)
+    for i, rating in items:
+        db.add_feedback(conn, "m", f"q{i}", f"a{i}", rating, source="t", event_id=f"e{i}")
+    got = [item["rating"] for item in db.get_untrained(conn, limit=8)]
+    # created_at ties within one second must fall back to insertion order, not
+    # index order — otherwise a round can train on an all-bad batch
+    assert got == [rating for _, rating in items][:8]

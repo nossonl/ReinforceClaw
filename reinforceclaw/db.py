@@ -94,7 +94,10 @@ _ALTER_COLUMNS = {
     "ema_state": {"reward_mean": "REAL DEFAULT 0.0", "count": "INTEGER DEFAULT 0"},
 }
 _FEEDBACK_WHERE = {"trained=0 AND rating!=0", "trained=1 AND rating!=0"}
-_FEEDBACK_ORDER = {"created_at ASC", "id ASC"}
+# created_at has second resolution; without the id tie-break, same-second ratings
+# come back grouped by rating via index order and a training round can see an
+# all-bad (or all-good) batch even when the user alternated.
+_FEEDBACK_ORDER = {"created_at ASC, id ASC", "id ASC"}
 
 
 def secure_private_dir(path: Path = PRIVATE_ROOT) -> Path:
@@ -355,7 +358,7 @@ def _feedback_filters(source=None, model=None):
 
 
 def get_untrained(conn, limit=0, source=None, model=None):
-    sql, params = _feedback_query("trained=0 AND rating!=0", "created_at ASC", limit, source, model)
+    sql, params = _feedback_query("trained=0 AND rating!=0", "created_at ASC, id ASC", limit, source, model)
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
