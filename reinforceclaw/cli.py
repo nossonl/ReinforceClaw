@@ -871,10 +871,12 @@ def cmd_train(_args):
         result = trainer.train_result(cfg, conn)
         if result.get("status") == "trained":
             metrics = {k: v for k, v in result.items() if k != "status"}
+            # the trainer already ran the full publish gate on save
+            # (_verify_saved_adapter raises on failure); only the loss check remains
             gate = (
                 {"ok": False, "reason": "nonfinite_loss"}
                 if not math.isfinite(float(metrics.get("avg_loss", float("nan"))))
-                else trainer.publish_gate(cfg, metrics["path"])
+                else {"ok": True}
             )
             if gate.get("ok"):
                 _active, load_status = _activate_candidate(conn, cfg, metrics)

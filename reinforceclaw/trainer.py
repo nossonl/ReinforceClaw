@@ -2048,23 +2048,35 @@ _FLOAT_EXP_MASKS = {
 }
 
 
+_FLOAT_NP_DTYPES = {2: "<u2", 4: "<u4", 8: "<u8"}
+
+
 def _scan_tensor_bytes(fh, remaining: int, dtype: str):
     itemsize, exp_mask = _FLOAT_EXP_MASKS.get(str(dtype).upper(), (0, 0))
     if itemsize and remaining % itemsize:
         return False, False, "adapter_safetensors_bad_dtype_size"
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
     has_nonzero, carry = False, b""
     while remaining > 0:
-        chunk = fh.read(min(65536, remaining))
+        chunk = fh.read(min(1 << 20 if np is not None else 65536, remaining))
         if not chunk:
             return has_nonzero, False, "adapter_safetensors_truncated"
-        has_nonzero = has_nonzero or any(chunk)
+        has_nonzero = has_nonzero or chunk.count(0) != len(chunk)
         remaining -= len(chunk)
         if itemsize:
             data = carry + chunk
             usable = len(data) - (len(data) % itemsize)
-            for pos in range(0, usable, itemsize):
-                if int.from_bytes(data[pos:pos + itemsize], "little") & exp_mask == exp_mask:
+            if np is not None:
+                values = np.frombuffer(data, dtype=_FLOAT_NP_DTYPES[itemsize], count=usable // itemsize)
+                if bool(np.any((values & exp_mask) == exp_mask)):
                     return has_nonzero, False, "adapter_nonfinite_tensor"
+            else:
+                for pos in range(0, usable, itemsize):
+                    if int.from_bytes(data[pos:pos + itemsize], "little") & exp_mask == exp_mask:
+                        return has_nonzero, False, "adapter_nonfinite_tensor"
             carry = data[usable:]
     return has_nonzero, True, ""
 
