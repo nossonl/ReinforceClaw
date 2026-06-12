@@ -1685,6 +1685,16 @@ def _make_loss_fn_mlx(model, tokenized, ref_logprobs, cfg, ema_mean, diag_sink=N
     return loss_fn
 
 
+def _dtype_kwarg(dtype) -> dict:
+    """transformers v5 renamed torch_dtype to dtype; the old name is silently
+    ignored there, which loads models in fp32 (2x memory, slower training)."""
+    import transformers
+
+    match = _VERSION_RE.match(str(transformers.__version__))
+    major = int(match.group(1)) if match else 0
+    return {"dtype": dtype} if major >= 5 else {"torch_dtype": dtype}
+
+
 def _torch_stack():
     try:
         import torch
@@ -2432,9 +2442,9 @@ def _attempt_train_cuda(config, conn, backend, hardware, attempt: int):
         base = AutoModelForCausalLM.from_pretrained(
             model_source,
             trust_remote_code=_trust_remote_code(config),
-            torch_dtype=backend.preferred_dtype(),
             low_cpu_mem_usage=True,
             local_files_only=local_only,
+            **_dtype_kwarg(backend.preferred_dtype()),
         ).to(backend.device)
         if hasattr(base, "config") and hasattr(base.config, "use_cache"):
             base.config.use_cache = False
