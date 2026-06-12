@@ -35,12 +35,13 @@ ReinforceClaw puts the control in your hands. With reinforcement learning, you r
 
 ## Results
 
-I tested this across 80 held-out prompts on both dense and MoE models. These are the results:
+I tested this across 80 held-out prompts:
 
 | Model | Δ |
 |---|---|
-| Gemma-4-31B dense | **+3.9%** |
-| Gemma-4-31B MoE | **+2.6%** |
+| Gemma-4-31B (dense) | **+3.9%** |
+
+MoE models are supported with their own config path (see Training presets below), and dedicated MoE benchmarks are coming.
  
 ## How it works
  
