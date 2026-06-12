@@ -35,13 +35,15 @@ ReinforceClaw puts the control in your hands. With reinforcement learning, you r
 
 ## Results
 
-I tested this across 80 held-out prompts:
+I tested this across 80 held-out prompts (paired judging, baseline vs trained, multi-round background training through the normal rating path):
 
 | Model | Δ |
 |---|---|
 | Gemma-4-31B (dense) | **+3.9%** |
+| OLMo-2-1B (dense) | **+11.2%** |
+| OLMoE-1B-7B (MoE, 1B active) | **+10.0%** |
 
-MoE models are supported with their own config path (see Training presets below), and dedicated MoE benchmarks are coming.
+One result worth knowing: the MoE run scored **−1.2%** when its ratings were 70% good, and **+10.0%** when good/bad ratings were balanced. Same model, same prompts. The "rate good responses too" warning below is not a suggestion — a one-sided rating stream collapses the learning signal.
  
 ## How it works
  
