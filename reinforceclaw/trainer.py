@@ -2359,9 +2359,12 @@ def _attempt_train_mlx(config, conn, backend, hardware, attempt: int):
                         for micro in range(cfg["grad_accum"]):
                             idx = micro_indices[step * cfg["grad_accum"] + micro]
                             loss, grads = vg(idx)
-                            mx.eval(loss)
-                            step_loss += _require_finite(loss.item())
                             acc_grads = grads if acc_grads is None else tree_map(lambda a, b: a + b, acc_grads, grads)
+                            # materialize per micro-step: leaving acc_grads lazy keeps every
+                            # micro-step's forward+backward graph (and its activations) alive
+                            # until the optimizer update, inflating peak memory ~grad_accum x
+                            mx.eval(loss, acc_grads)
+                            step_loss += _require_finite(loss.item())
 
                         if acc_grads is None:
                             return _skip("no_trainable_gradients", backend="mlx")
