@@ -162,14 +162,6 @@ def _load_model_cfg():
     return None
 
 
-def _swap_latest(cfg, conn):
-    latest = db.latest_adapter(conn, model=cfg.get("model"))
-    if not latest:
-        return "none"
-    ok = _load_adapter_status(cfg, latest["path"])
-    return "loaded_ollama" if ok is True and cfg.get("server", "ollama") == "ollama" else "loaded" if ok is True else "failed" if ok is False else "manual"
-
-
 def _load_adapter_status(cfg, path):
     return trainer.load_adapter(cfg.get("server", "ollama"), path, cfg.get("serve_model") or cfg["model"], cfg.get("server_url") or cfg.get("vllm_url"))
 

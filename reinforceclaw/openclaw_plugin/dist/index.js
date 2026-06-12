@@ -73,9 +73,6 @@ const BRIDGE_TIMEOUT_MS = 15e3;
 const TRUNCATION_MARKER = "\n...[reinforceclaw truncated oversized text]\n";
 const DEFAULT_HOST = "http://127.0.0.1:8420";
 const PERMANENT_CAPTURE_REJECTS = /* @__PURE__ */ new Set([400, 411, 413, 414, 415]);
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 function idOf(value, depth = 0) {
   if (depth > 4 || value === void 0 || value === null) return "";
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
@@ -481,13 +478,6 @@ async function bridgeReady(host) {
   } catch {
     return false;
   }
-}
-async function waitForBridge(host) {
-  for (let i = 0; i < 10; i++) {
-    if (await bridgeReady(host)) return true;
-    await sleep(200);
-  }
-  return false;
 }
 function fetchWithTimeout(url, init = {}, timeoutMs = BRIDGE_TIMEOUT_MS) {
   const controller = new AbortController();

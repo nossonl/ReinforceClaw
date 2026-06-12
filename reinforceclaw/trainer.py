@@ -2812,8 +2812,6 @@ def _commit_adapter_dir(temp_dir: Path, final_dir: Path) -> None:
 
 
 def _convert_to_gguf(adapter_dir):
-    import subprocess
-
     safetensors_file = Path(adapter_dir) / "adapter.safetensors"
     if not safetensors_file.exists():
         safetensors_file = Path(adapter_dir) / "adapter_model.safetensors"
@@ -2839,7 +2837,6 @@ def _convert_to_gguf(adapter_dir):
 
 def load_adapter(server_type, adapter_path, model_name, server_url=None):
     import requests
-    import hashlib
 
     def local_server_url(value, default):
         base_url = str(value or default).rstrip("/")

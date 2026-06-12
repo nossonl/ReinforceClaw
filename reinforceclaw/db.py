@@ -343,10 +343,6 @@ def _feedback_query(base_where: str, order: str, limit: int, source=None, model=
     return sql, params
 
 
-def _source_clause(source):
-    return (" AND source=?", (source,)) if source is not None else ("", ())
-
-
 def _feedback_filters(source=None, model=None):
     parts, params = [], []
     if source is not None:

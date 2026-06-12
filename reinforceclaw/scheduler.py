@@ -184,10 +184,6 @@ def _parse_time(s):
 
 
 def _install_launchd(attempt_times):
-    env_xml = "\n".join(
-        f"        <key>{xml_escape(key)}</key>\n        <string>{xml_escape(value)}</string>"
-        for key, value in {"PYTHONPATH": str(PROJECT_ROOT), **_scheduler_env()}.items()
-    )
     intervals = "\n".join(
         f"""        <dict>
             <key>Hour</key>
@@ -215,7 +211,7 @@ def _install_launchd(attempt_times):
     <string>{xml_escape(str(PROJECT_ROOT))}</string>
     <key>EnvironmentVariables</key>
     <dict>
-{env_xml}
+{_service_env_xml()}
     </dict>
     <key>StartCalendarInterval</key>
     <array>
@@ -253,7 +249,7 @@ Description=ReinforceClaw RL training
 ExecStart={_systemd_arg(sys.executable)} -m reinforceclaw.cli train --background
 WorkingDirectory={_systemd_arg(PROJECT_ROOT)}
 Environment="PYTHONPATH={_systemd_env(PROJECT_ROOT)}"
-{chr(10).join(f'Environment="{_systemd_env(k)}={_systemd_env(v)}"' for k, v in _scheduler_env().items())}
+{_service_env_systemd()}
 StandardOutput=append:{_systemd_arg(TRAIN_LOG)}
 StandardError=append:{_systemd_arg(TRAIN_LOG)}
 """)
