@@ -31,6 +31,9 @@ _SECRET_RE = re.compile(
     r"https?://[^\s/@:]+:[^\s/@]+@)"
 )
 
+# bump whenever SCHEMA or _migrate changes so existing databases re-run them
+SCHEMA_VERSION = 3
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,11 +161,15 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA secure_delete=ON")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
-    conn.execute("INSERT OR IGNORE INTO ema_state (id, reward_mean, count) VALUES (1, 0.0, 0)")
-    conn.execute("INSERT OR IGNORE INTO training_state (id, state) VALUES (1, NULL)")
-    conn.commit()
+    # schema/migrations take a write lock and commit; skip them when this
+    # database is already current (every hook fire and bridge request connects)
+    if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+        conn.execute("INSERT OR IGNORE INTO ema_state (id, reward_mean, count) VALUES (1, 0.0, 0)")
+        conn.execute("INSERT OR IGNORE INTO training_state (id, state) VALUES (1, NULL)")
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION:d}")
+        conn.commit()
     _secure_sqlite_files(path)
     return conn
 

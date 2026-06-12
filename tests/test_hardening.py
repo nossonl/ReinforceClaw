@@ -1222,3 +1222,23 @@ def test_balance_warning_uses_recent_window_only(tmp_path):
     for i in range(db.BALANCE_WINDOW):
         db.add_feedback(conn, "m", f"new{i}", "r", -1 if i % 2 else 1, source="s")
     assert db.rating_balance_warning(conn, model="m") is None
+
+
+def test_connect_skips_migrations_when_current(tmp_path, monkeypatch):
+    path = tmp_path / "rc.db"
+    db.connect(path).close()
+    # second connect must take the fast path: no executescript
+    import sqlite3
+    ran = []
+    orig = sqlite3.Connection.executescript
+    monkeypatch.setattr(sqlite3.Connection, "executescript",
+                        lambda self, sql: ran.append(1) or orig(self, sql))
+    conn = db.connect(path)
+    assert not ran
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    # an out-of-date db re-runs migrations
+    conn.execute("PRAGMA user_version=0")
+    conn.commit()
+    conn.close()
+    db.connect(path).close()
+    assert ran
