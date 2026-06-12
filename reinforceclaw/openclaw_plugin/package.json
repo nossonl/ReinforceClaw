@@ -5,8 +5,19 @@
   "type": "module",
   "license": "MIT",
   "author": "ReinforceClaw",
-  "keywords": ["openclaw", "plugin", "reinforcement-learning", "feedback", "lora"],
-  "files": ["README.md", "openclaw.plugin.json", "src/index.ts"],
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "reinforcement-learning",
+    "feedback",
+    "lora"
+  ],
+  "files": [
+    "README.md",
+    "openclaw.plugin.json",
+    "dist/index.js",
+    "src/index.ts"
+  ],
   "publishConfig": {
     "access": "public"
   },
@@ -19,5 +30,9 @@
     "url": "https://github.com/nossonl/ReinforceClaw/issues"
   },
   "homepage": "https://github.com/nossonl/ReinforceClaw#readme",
-  "openclaw": { "extensions": ["./src/index.ts"] }
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
 }

@@ -61,6 +61,7 @@ include-package-data = false
 reinforceclaw = [
     "openclaw_plugin/openclaw.plugin.json",
     "openclaw_plugin/package.json",
+    "openclaw_plugin/dist/index.js",
     "openclaw_plugin/src/index.ts",
 ]
 
