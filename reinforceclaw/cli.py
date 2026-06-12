@@ -857,7 +857,7 @@ def cmd_train(_args):
     conn = db.connect()
     try:
         n = db.count_trainable_untrained(conn, model=cfg.get("model"))
-        batch_min = cfg.get("batch_min", 8)
+        batch_min = cfg.get("batch_min", db.BATCH_MIN_DEFAULT)
         resume = trainer._resume_state(conn, cfg)
         if background:
             TRAIN_RETRY_PATH.unlink(missing_ok=True)
@@ -1017,7 +1017,7 @@ def _maybe_train(cfg, conn):
         return
     if cfg.get("train_schedule", "auto") != "auto":
         return
-    if db.count_trainable_untrained(conn, model=cfg.get("model")) >= cfg.get("batch_min", 8):
+    if db.count_trainable_untrained(conn, model=cfg.get("model")) >= cfg.get("batch_min", db.BATCH_MIN_DEFAULT):
         from reinforceclaw.hooks._common import queue_training
         console.print("[dim]Batch ready, training queued in background...[/dim]")
         queue_training()

@@ -678,7 +678,7 @@ def _background_block_reason(config, backend, hardware) -> str | None:
 def smoke_status(config, conn):
     cfg = {**config, "_background": True}
     trainable = db.count_trainable_untrained(conn, source=_feedback_source(cfg), model=cfg.get("model"))
-    batch_min = cfg.get("batch_min", 32)
+    batch_min = cfg.get("batch_min", db.BATCH_MIN_DEFAULT)
     if trainable < batch_min:
         return {"would_train": False, "reason": "below_threshold", "trainable": trainable, "batch_min": batch_min}
     compat = model_compatibility(cfg)
@@ -973,7 +973,7 @@ def _resume_state(conn, config):
         "requested_steps": int(config.get("steps", 8)),
         "lr": float(config.get("lr", 8e-6)),
         "kl_coeff": float(config.get("kl_coeff", 0.001)),
-        "batch_size": int(config.get("batch_size", config.get("batch_min", 32))),
+        "batch_size": int(config.get("batch_size", config.get("batch_min", db.BATCH_MIN_DEFAULT))),
         "replay_ratio": float(config.get("replay_ratio", 0.0)),
         "traj_clip": [float(x) for x in config.get("traj_clip", [0.996, 1.001])],
         "token_clip": [float(x) for x in config.get("token_clip", [0.5, 2.0])],
@@ -1124,7 +1124,7 @@ def _training_state_payload(config, cfg, backend_name, batch, fresh_ids, resume,
         "requested_steps": int(config.get("steps", 8)),
         "lr": float(config.get("lr", 8e-6)),
         "kl_coeff": float(cfg.get("kl_coeff", 0.001)),
-        "batch_size": int(config.get("batch_size", config.get("batch_min", 32))),
+        "batch_size": int(config.get("batch_size", config.get("batch_min", db.BATCH_MIN_DEFAULT))),
         "replay_ratio": float(config.get("replay_ratio", 0.0)),
         "traj_clip": [float(x) for x in cfg["traj_clip"]],
         "token_clip": [float(x) for x in cfg["token_clip"]],
@@ -1229,7 +1229,7 @@ def _plan_strategy(config, hardware, model_bytes: int) -> TrainingPlan | None:
     if budget < MIN_TRAINING_BUDGET:
         return None
 
-    batch_cap = max(1, int(config.get("batch_size", config.get("batch_min", 32))))
+    batch_cap = max(1, int(config.get("batch_size", config.get("batch_min", db.BATCH_MIN_DEFAULT))))
     base_accum = max(1, config.get("grad_accum", 4))
     base_steps = max(1, config.get("steps", 8))
     preload = _preload_limit_bytes(hardware, reserve_bytes)
@@ -2692,8 +2692,8 @@ def train_result(config, conn):
 
         resume = _resume_state(conn, config)
         trainable = db.count_trainable_untrained(conn, source=_feedback_source(config), model=config.get("model"))
-        if not resume and trainable < config.get("batch_min", 32):
-            return _skip("below_threshold", trainable=trainable, batch_min=config.get("batch_min", 32))
+        if not resume and trainable < config.get("batch_min", db.BATCH_MIN_DEFAULT):
+            return _skip("below_threshold", trainable=trainable, batch_min=config.get("batch_min", db.BATCH_MIN_DEFAULT))
 
         compat = model_compatibility(config)
         if not compat["ok"]:

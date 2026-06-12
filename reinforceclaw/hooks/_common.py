@@ -555,7 +555,7 @@ def maybe_train(conn, config):
     schedule = config.get("train_schedule", "auto")
     if schedule != "auto":
         return  # scheduled training handles it, don't train in the hook
-    if db.count_trainable_untrained(conn, model=config.get("model")) >= config.get("batch_min", 32):
+    if db.count_trainable_untrained(conn, model=config.get("model")) >= config.get("batch_min", db.BATCH_MIN_DEFAULT):
         queue_training()
 
 

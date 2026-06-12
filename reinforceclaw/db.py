@@ -13,6 +13,7 @@ MAX_TEXT_BYTES = 2_000_000
 TRUNCATION_MARKER = "\n...[reinforceclaw truncated oversized text]"
 RECENT_LIMIT = 20
 MAX_FEEDBACK_ROWS = 100_000
+BATCH_MIN_DEFAULT = 32  # single fallback for configs missing batch_min
 MAX_SOURCE_BYTES = 128
 MAX_EVENT_ID_BYTES = 512
 _SECRET_RE = re.compile(
