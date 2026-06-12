@@ -80,7 +80,7 @@ def _status_payload(conn):
     counts = db.count(conn, model=model)
     ema, _ = db.get_ema(conn, model=model)
     adapter = db.latest_adapter(conn, model=model)
-    return {
+    payload = {
         "adapter": f"v{adapter['version']}" if adapter else "none",
         "ratings": counts["total"],
         "good": counts["good"],
@@ -88,6 +88,10 @@ def _status_payload(conn):
         "untrained": db.count_trainable_untrained(conn, model=model),
         "ema": round(ema, 3),
     }
+    warning = db.rating_balance_warning(conn, model=model)
+    if warning:
+        payload["warning"] = warning
+    return payload
 
 
 def _send_json(handler, payload, code=200):

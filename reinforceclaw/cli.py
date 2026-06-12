@@ -968,6 +968,9 @@ def cmd_status(_args):
             ("EMA", f"{ema_mean:.3f} ({ema_count} updates)"),
             ("Panel", "on" if cfg.get("panel_enabled", True) else "off"),
         )))
+        warning = db.rating_balance_warning(conn, model=cfg.get("model"))
+        if warning:
+            console.print(f"[yellow]{warning}[/yellow]")
     finally:
         conn.close()
 

@@ -1182,3 +1182,43 @@ def test_untrained_selection_follows_arrival_order_within_same_second(tmp_path):
     # created_at ties within one second must fall back to insertion order, not
     # index order — otherwise a round can train on an all-bad batch
     assert got == [rating for _, rating in items][:8]
+
+
+# ---------- rating balance warning ----------
+
+def test_balance_warning_one_sided_good(tmp_path):
+    conn = db.connect(tmp_path / "rc.db")
+    for i in range(25):
+        db.add_feedback(conn, "m", f"p{i}", f"r{i}", 1, source="s")
+    warning = db.rating_balance_warning(conn, model="m")
+    assert warning and "good" in warning
+
+
+def test_balance_warning_one_sided_bad(tmp_path):
+    conn = db.connect(tmp_path / "rc.db")
+    for i in range(25):
+        db.add_feedback(conn, "m", f"p{i}", f"r{i}", -1, source="s")
+    warning = db.rating_balance_warning(conn, model="m")
+    assert warning and "bad" in warning and "degrade" in warning
+
+
+def test_balance_warning_balanced_or_sparse_is_none(tmp_path):
+    conn = db.connect(tmp_path / "rc.db")
+    # under BALANCE_MIN ratings: no warning even though 100% good
+    for i in range(db.BALANCE_MIN - 1):
+        db.add_feedback(conn, "m", f"p{i}", f"r{i}", 1, source="s")
+    assert db.rating_balance_warning(conn, model="m") is None
+    # top up to a balanced stream: still no warning
+    for i in range(30):
+        db.add_feedback(conn, "m", f"q{i}", f"r{i}", -1 if i % 2 else 1, source="s")
+    assert db.rating_balance_warning(conn, model="m") is None
+
+
+def test_balance_warning_uses_recent_window_only(tmp_path):
+    conn = db.connect(tmp_path / "rc.db")
+    # old history is all bad, but the recent window is balanced
+    for i in range(60):
+        db.add_feedback(conn, "m", f"old{i}", "r", -1, source="s")
+    for i in range(db.BALANCE_WINDOW):
+        db.add_feedback(conn, "m", f"new{i}", "r", -1 if i % 2 else 1, source="s")
+    assert db.rating_balance_warning(conn, model="m") is None

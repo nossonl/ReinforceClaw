@@ -477,6 +477,38 @@ def count(conn, model=None):
     return dict(row)
 
 
+BALANCE_WINDOW = 50
+BALANCE_MIN = 20
+BALANCE_THRESHOLD = 0.7
+
+
+def rating_balance_warning(conn, model=None, window=BALANCE_WINDOW):
+    """Warn when the recent rating stream is one-sided enough to weaken training.
+
+    The EMA baseline pins near the majority sign, collapsing that side's
+    advantage (measured: the same model scored -1.2% on a 70%-good stream and
+    +10.0% balanced). Returns a message, or None when balanced or under
+    BALANCE_MIN recent ratings.
+    """
+    filters, params = _feedback_filters(model=model)
+    rows = conn.execute(
+        f"SELECT rating FROM feedback WHERE rating!=0{filters} "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        params + (window,),
+    ).fetchall()
+    total = len(rows)
+    if total < BALANCE_MIN:
+        return None
+    good = sum(1 for r in rows if r["rating"] == 1)
+    if good >= total * BALANCE_THRESHOLD:
+        return (f"{good} of your last {total} ratings are good. One-sided ratings "
+                "weaken training - keep rating bad responses too when they deserve it.")
+    if total - good >= total * BALANCE_THRESHOLD:
+        return (f"{total - good} of your last {total} ratings are bad. One-sided ratings "
+                "weaken training and can degrade the model - rate good responses too.")
+    return None
+
+
 def count_trainable_untrained(conn, source=None, model=None):
     filters, params = _feedback_filters(source, model)
     row = conn.execute(f"SELECT COUNT(*) AS total FROM feedback WHERE trained=0 AND rating!=0{filters}", params).fetchone()
