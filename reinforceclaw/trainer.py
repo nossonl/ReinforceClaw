@@ -1481,10 +1481,14 @@ def _tokenize_mlx(tokenizer, item):
     return out
 
 
-def _compute_logprobs_mlx(model, input_ids):
+def _compute_logprobs_mlx(model, input_ids, start=1):
+    """Response-token logprobs via gather - logsumexp in float32, so the full
+    [seq, vocab] log-softmax buffer is never materialized. No-grad paths only."""
+    start = max(1, int(start))
     logits = model(input_ids[None, :]).squeeze(0)
-    lp = nn.log_softmax(logits, axis=-1)
-    return mx.take_along_axis(lp[:-1], input_ids[1:, None], axis=-1).squeeze(-1)
+    rows = logits[start - 1:-1].astype(mx.float32)
+    picked = mx.take_along_axis(rows, input_ids[start:, None], axis=-1).squeeze(-1)
+    return picked - mx.logsumexp(rows, axis=-1)
 
 
 def _fallback_chat_text(messages, *, add_generation_prompt=False):
@@ -1623,16 +1627,19 @@ def _make_loss_fn_mlx(model, tokenized, ref_logprobs, cfg, ema_mean, diag_sink=N
     def loss_fn(idx: int):
         item = tokenized[idx]
         ids, start, rating = item["input_ids"], item["response_start"], item["rating"]
-        ref = ref_logprobs[idx]
+        ref_r = ref_logprobs[idx]
+        n_resp = max(0, int(ids.shape[0]) - int(start))
         logits = model(ids[None, :]).squeeze(0)
-        new_lp = mx.take_along_axis(
-            nn.log_softmax(logits, axis=-1)[:-1],
-            ids[1:, None],
+        if n_resp == 0 or int(ref_r.shape[0]) == 0:
+            return mx.sum(logits) * 0.0
+        # Only response rows go through log_softmax; identical numerics to the
+        # full-sequence version, minus the prompt-position [seq, vocab] buffer.
+        rows = logits[start - 1:-1]
+        new_r = mx.take_along_axis(
+            nn.log_softmax(rows, axis=-1),
+            ids[start:, None],
             axis=-1,
         ).squeeze(-1)
-        new_r, ref_r = new_lp[start - 1:], ref[start - 1:]
-        if int(new_r.shape[0]) == 0 or int(ref_r.shape[0]) == 0:
-            return mx.sum(logits) * 0.0
         adv_scalar = item.get("advantage", _scalar_advantage(rating, ema_mean, cfg))
         adv = mx.array(adv_scalar, dtype=new_r.dtype)
 
@@ -1664,7 +1671,7 @@ def _make_loss_fn_mlx(model, tokenized, ref_logprobs, cfg, ema_mean, diag_sink=N
             return -mx.mean(new_r * adjusted)
         behavior_r = _behavior_logprobs(item, int(new_r.shape[0]), "mlx") if loss_name == "mis-po" else ref_r
         if behavior_r is None:
-            behavior_r = behavior_logprobs[idx][start - 1:] if behavior_logprobs is not None else ref_r
+            behavior_r = behavior_logprobs[idx] if behavior_logprobs is not None else ref_r
 
         ratio = mx.exp(new_r - behavior_r)
         clipped_ratio = mx.clip(ratio, tc_lo, tc_hi)
@@ -1933,7 +1940,24 @@ def _torch_accepts(model, key):
     return accepts_kwargs or key in names
 
 
-def _torch_forward_kwargs(model, item, torch):
+def _logits_to_keep_key(model) -> str | None:
+    """Named-parameter check on the *base* model (PEFT/compile wrappers expose
+    **kwargs, which would falsely accept anything)."""
+    base = model
+    getter = getattr(model, "get_base_model", None)
+    if callable(getter):
+        try:
+            base = getter()
+        except Exception:
+            base = model
+    names, _ = _torch_forward_params(base)
+    for key in ("logits_to_keep", "num_logits_to_keep"):
+        if key in names:
+            return key
+    return None
+
+
+def _torch_forward_kwargs(model, item, torch, logits_to_keep=None):
     ids = item["input_ids"].unsqueeze(0)
     kwargs = {"input_ids": ids}
     attention_mask = item.get("attention_mask")
@@ -1948,17 +1972,41 @@ def _torch_forward_kwargs(model, item, torch):
         and _torch_accepts(model, "mm_token_type_ids")
     ):
         kwargs["mm_token_type_ids"] = torch.zeros_like(ids)
+    if logits_to_keep:
+        key = _logits_to_keep_key(model)
+        if key:
+            kwargs[key] = int(logits_to_keep)
     return kwargs
 
 
+_LOGPROB_CHUNK = 1024
+
+
+def _selective_logprobs_torch(logits, targets, torch):
+    """Per-token logprobs as gather(x) - logsumexp(x) in float32 chunks, so the
+    full [seq, vocab] log-softmax buffer is never materialized. No-grad paths only."""
+    out = []
+    for pos in range(0, int(targets.shape[0]), _LOGPROB_CHUNK):
+        chunk = logits[pos:pos + _LOGPROB_CHUNK].float()
+        picked = chunk.gather(-1, targets[pos:pos + _LOGPROB_CHUNK].unsqueeze(-1)).squeeze(-1)
+        out.append(picked - chunk.logsumexp(dim=-1))
+    return torch.cat(out)
+
+
 def _compute_logprobs_torch(model, item, torch):
+    """Response-token logprobs only. The LM head is skipped for prompt positions
+    when the model supports logits_to_keep; the slice below is a no-op in that case."""
     with torch.no_grad():
         device = next(model.parameters()).device
         device_item = _torch_move_item(item, device)
-        logits = model(**_torch_forward_kwargs(model, device_item, torch)).logits.squeeze(0)
-        lp = torch.log_softmax(logits, dim=-1)
         ids = device_item["input_ids"]
-        return lp[:-1].gather(-1, ids[1:].unsqueeze(-1)).squeeze(-1)
+        n_resp = max(0, int(ids.shape[0]) - int(item["response_start"]))
+        if n_resp == 0:
+            return torch.zeros(0, device=device)
+        kwargs = _torch_forward_kwargs(model, device_item, torch, logits_to_keep=n_resp + 1)
+        logits = model(**kwargs).logits.squeeze(0)
+        rows = logits[-(n_resp + 1):-1]
+        return _selective_logprobs_torch(rows, ids[-n_resp:], torch)
 
 
 @contextmanager
@@ -2114,12 +2162,15 @@ def _make_loss_fn_torch(model, tokenized, ref_logprobs, cfg, ema_mean, torch, di
     def loss_fn(idx: int):
         item = _torch_move_item(tokenized[idx], device)
         ids, start, rating = item["input_ids"], item["response_start"], item["rating"]
-        ref = ref_logprobs[idx]
-        logits = model(**_torch_forward_kwargs(model, item, torch)).logits.squeeze(0)
-        new_lp = torch.log_softmax(logits, dim=-1)[:-1].gather(-1, ids[1:].unsqueeze(-1)).squeeze(-1)
-        new_r, ref_r = new_lp[start - 1:], ref[start - 1:]
-        if new_r.numel() == 0 or ref_r.numel() == 0:
+        ref_r = ref_logprobs[idx]
+        n_resp = max(0, int(ids.shape[0]) - int(start))
+        logits = model(**_torch_forward_kwargs(model, item, torch, logits_to_keep=n_resp + 1 if n_resp else None)).logits.squeeze(0)
+        if n_resp == 0 or ref_r.numel() == 0:
             return logits.sum() * 0.0
+        # Only response rows go through log_softmax; identical numerics to the
+        # full-sequence version, minus the prompt-position [seq, vocab] buffer.
+        rows = logits[-(n_resp + 1):-1]
+        new_r = torch.log_softmax(rows, dim=-1).gather(-1, ids[-n_resp:].unsqueeze(-1)).squeeze(-1)
         adv_scalar = item.get("advantage", _scalar_advantage(rating, ema_mean, cfg))
         adv = torch.tensor(adv_scalar, device=ids.device, dtype=new_r.dtype)
 
@@ -2153,7 +2204,7 @@ def _make_loss_fn_torch(model, tokenized, ref_logprobs, cfg, ema_mean, torch, di
             return -(new_r * adjusted).mean()
         behavior_r = _behavior_logprobs(item, int(new_r.shape[0]), "torch", torch_module=torch) if loss_name == "mis-po" else ref_r
         if behavior_r is None:
-            behavior_r = behavior_logprobs[idx][start - 1:] if behavior_logprobs is not None else ref_r
+            behavior_r = behavior_logprobs[idx] if behavior_logprobs is not None else ref_r
 
         ratio = torch.exp(new_r - behavior_r)
         clipped_ratio = ratio.clamp(tc_lo, tc_hi)
@@ -2231,11 +2282,11 @@ def _attempt_train_mlx(config, conn, backend, hardware, attempt: int):
         tokenized = _attach_advantages([tok for _, tok in pairs], ema_mean, cfg)
         behavior_lps = None
         if str(cfg.get("loss_fn", "mis-po")).lower() == "mis-po" and parent_path:
-            behavior_lps = [mx.stop_gradient(_compute_logprobs_mlx(model, item["input_ids"])) for item in tokenized]
+            behavior_lps = [mx.stop_gradient(_compute_logprobs_mlx(model, item["input_ids"], item["response_start"])) for item in tokenized]
             mx.eval(*behavior_lps)
         saved_lora = _disable_lora(model)
         try:
-            ref_lps = [mx.stop_gradient(_compute_logprobs_mlx(model, item["input_ids"])) for item in tokenized]
+            ref_lps = [mx.stop_gradient(_compute_logprobs_mlx(model, item["input_ids"], item["response_start"])) for item in tokenized]
             mx.eval(*ref_lps)
         finally:
             _enable_lora(model, saved_lora)

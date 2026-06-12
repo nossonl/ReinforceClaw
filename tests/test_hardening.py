@@ -1097,10 +1097,14 @@ def test_reset_state_deletes_configured_private_adapter_root(monkeypatch, tmp_pa
 
 def test_openclaw_plugin_does_not_request_unsafe_runtime_access():
     root = cli.Path(__file__).resolve().parents[1] / "reinforceclaw" / "openclaw_plugin"
-    source = (root / "src" / "index.ts").read_text(encoding="utf-8")
     manifest = json.loads((root / "openclaw.plugin.json").read_text(encoding="utf-8"))
     forbidden = ("child_process", "process.env", "spawn(", "readFileSync", "reinforceclawPython")
-    assert not any(token in source for token in forbidden)
+    for entry in (root / "src" / "index.ts", root / "dist" / "index.js"):
+        source = entry.read_text(encoding="utf-8")
+        assert not any(token in source for token in forbidden), entry
+    pkg = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    # OpenClaw >= 2026.6 rejects TypeScript entries in installed packages
+    assert pkg["openclaw"]["extensions"] == ["./dist/index.js"]
     assert "reinforceclawPython" not in manifest["configSchema"]["properties"]
 
 
@@ -1115,3 +1119,51 @@ def test_openclaw_bridge_launchd_service_uses_python_module(monkeypatch, tmp_pat
     assert "reinforceclaw.hooks.openclaw" in plist
     assert "REINFORCECLAW_OPENCLAW_SECRET" not in plist
     assert ["launchctl", "load", str(scheduler.BRIDGE_PLIST_PATH)] in loaded
+
+
+def test_selective_logprobs_torch_matches_log_softmax():
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(7)
+    for seq, vocab in ((5, 64), (2049, 32)):  # second case crosses the chunk boundary
+        logits = torch.randn(seq, vocab)
+        targets = torch.randint(0, vocab, (seq,))
+        expected = torch.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        got = trainer._selective_logprobs_torch(logits, targets, torch)
+        assert torch.allclose(got, expected, atol=1e-5)
+
+
+def test_compute_logprobs_mlx_matches_sliced_log_softmax():
+    mx = pytest.importorskip("mlx.core")
+    mlx_nn = pytest.importorskip("mlx.nn")
+    import random
+
+    trainer._ensure_mlx()
+    rng = random.Random(7)
+    seq, vocab, start = 9, 32, 4
+    raw = [[rng.uniform(-4, 4) for _ in range(vocab)] for _ in range(seq)]
+    ids = mx.array([rng.randrange(vocab) for _ in range(seq)])
+    logits = mx.array(raw)
+    model = lambda batch: logits[None, :]
+    got = trainer._compute_logprobs_mlx(model, ids, start)
+    full = mlx_nn.log_softmax(logits, axis=-1)
+    expected = mx.take_along_axis(full[:-1], ids[1:, None], axis=-1).squeeze(-1)[start - 1:]
+    assert got.shape == expected.shape
+    assert bool(mx.allclose(got, expected, atol=1e-5).item())
+
+
+def test_forward_kwargs_only_pass_logits_to_keep_when_named():
+    torch = pytest.importorskip("torch")
+
+    class Named:
+        def forward(self, input_ids=None, logits_to_keep=0):
+            return None
+
+    class KwargsOnly:
+        def forward(self, input_ids=None, **kwargs):
+            return None
+
+    item = {"input_ids": torch.tensor([1, 2, 3])}
+    named = trainer._torch_forward_kwargs(Named(), item, torch, logits_to_keep=2)
+    assert named.get("logits_to_keep") == 2
+    loose = trainer._torch_forward_kwargs(KwargsOnly(), item, torch, logits_to_keep=2)
+    assert "logits_to_keep" not in loose and "num_logits_to_keep" not in loose
