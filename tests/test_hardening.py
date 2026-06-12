@@ -1227,12 +1227,10 @@ def test_balance_warning_uses_recent_window_only(tmp_path):
 def test_connect_skips_migrations_when_current(tmp_path, monkeypatch):
     path = tmp_path / "rc.db"
     db.connect(path).close()
-    # second connect must take the fast path: no executescript
-    import sqlite3
+    # second connect must take the fast path: no _migrate call
     ran = []
-    orig = sqlite3.Connection.executescript
-    monkeypatch.setattr(sqlite3.Connection, "executescript",
-                        lambda self, sql: ran.append(1) or orig(self, sql))
+    orig = db._migrate
+    monkeypatch.setattr(db, "_migrate", lambda conn: ran.append(1) or orig(conn))
     conn = db.connect(path)
     assert not ran
     assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
